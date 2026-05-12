@@ -24,14 +24,6 @@
 #define YABRIDGE_EXPORT __attribute__((visibility("default")))
 
 /**
- * The interval in seconds between synchronizing the Wine plugin host's audio
- * thread scheduling priority with the host's audio thread.
- *
- * @relates Vst2Bridge::last_audio_thread_priority_synchronization
- */
-constexpr time_t audio_thread_priority_synchronization_interval = 10;
-
-/**
  * When the `hide_daw` compatibility option is enabled, we'll report this
  * instead of the actual DAW's name. This can be useful when plugins are
  * hardcoded to behave differently in certain DAWs, and when that different
