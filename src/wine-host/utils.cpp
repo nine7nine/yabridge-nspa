@@ -16,6 +16,21 @@
 
 #include "utils.h"
 
+// NSPA: pidfd_open syscall for the event-driven watchdog. Kernel ≥ 5.3
+// for pidfd_open itself; PIDFD_NONBLOCK requires kernel ≥ 5.10. We
+// fall back to PIDFD_NONBLOCK=0 if the header doesn't define it (very
+// old glibc); pidfd_open will return a blocking fd, which is still
+// fine because async_wait only POLLINs, never reads bytes.
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef PIDFD_NONBLOCK
+#define PIDFD_NONBLOCK O_NONBLOCK
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434  // x86_64
+#endif
+
 #include <iostream>
 
 #include "bridges/common.h"
@@ -129,45 +144,96 @@ void MainContext::update_timer_interval(
     timer_interval_ = new_interval;
 }
 
-MainContext::WatchdogGuard::WatchdogGuard(
-    HostBridge& bridge,
-    std::unordered_set<HostBridge*>& watched_bridges,
-    std::mutex& watched_bridges_mutex)
-    : bridge_(&bridge),
-      watched_bridges_(watched_bridges),
-      watched_bridges_mutex_(watched_bridges_mutex) {
-    std::lock_guard lock(watched_bridges_mutex);
-    watched_bridges.insert(&bridge);
+MainContext::WatchdogGuard::WatchdogGuard(HostBridge& bridge,
+                                          MainContext& main_context,
+                                          pid_t parent_pid)
+    : bridge_(&bridge), main_context_(main_context) {
+    std::lock_guard lock(main_context.watched_bridges_mutex_);
+    main_context.watched_bridges_.insert(&bridge);
+
+    // NSPA: open a pidfd on the parent and async_wait POLLIN via the
+    // watchdog io_context. The async handler fires shutdown_if_dangling
+    // the instant the kernel sees the parent exit — zero polling
+    // latency. The handler takes the same mutex and checks the bridge
+    // is still in watched_bridges_ before dereferencing, so a teardown
+    // race (bridge destruction concurrent with handler scheduling)
+    // can't UAF.
+    //
+    // syscall(SYS_pidfd_open, ...) — pidfd_open(2), kernel ≥ 5.3.
+    // CLOEXEC by default; we set O_NONBLOCK so async_wait doesn't ever
+    // need to block on read (we only POLLIN, never read bytes).
+    const int pidfd =
+        static_cast<int>(syscall(SYS_pidfd_open, parent_pid, PIDFD_NONBLOCK));
+    if (pidfd >= 0) {
+        try {
+            auto [it, inserted] = main_context.pidfd_watches_.try_emplace(
+                &bridge, main_context.watchdog_context_, pidfd);
+            if (inserted) {
+                MainContext* mc = &main_context;
+                HostBridge* bp = &bridge;
+                it->second.async_wait(
+                    asio::posix::stream_descriptor::wait_read,
+                    [mc, bp](const std::error_code& ec) {
+                        if (ec) {
+                            // operation_aborted from teardown, or some
+                            // transient — leave the 30s timer to catch up.
+                            return;
+                        }
+                        std::lock_guard lock(mc->watched_bridges_mutex_);
+                        if (mc->watched_bridges_.contains(bp)) {
+                            bp->shutdown_if_dangling();
+                        }
+                    });
+            } else {
+                // Already had a watch for this bridge — shouldn't happen.
+                ::close(pidfd);
+            }
+        } catch (const std::exception&) {
+            ::close(pidfd);
+        }
+    }
+    // On pidfd_open failure (older kernel, ENOMEM, etc.) the 30s polling
+    // watchdog still catches the dangling case — just with up to 30s
+    // detection latency instead of instant.
 }
 
 MainContext::WatchdogGuard::~WatchdogGuard() noexcept {
     if (is_active_) {
-        std::lock_guard lock(watched_bridges_mutex_.get());
-        watched_bridges_.get().erase(bridge_);
+        main_context_.get().unregister_watchdog(*bridge_);
     }
 }
 
 MainContext::WatchdogGuard::WatchdogGuard(WatchdogGuard&& o) noexcept
     : bridge_(std::move(o.bridge_)),
-      watched_bridges_(std::move(o.watched_bridges_)),
-      watched_bridges_mutex_(std::move(o.watched_bridges_mutex_)) {
+      main_context_(std::move(o.main_context_)) {
     o.is_active_ = false;
 }
 
 MainContext::WatchdogGuard& MainContext::WatchdogGuard::operator=(
     WatchdogGuard&& o) noexcept {
     bridge_ = std::move(o.bridge_);
-    watched_bridges_ = std::move(o.watched_bridges_);
-    watched_bridges_mutex_ = std::move(o.watched_bridges_mutex_);
+    main_context_ = std::move(o.main_context_);
     o.is_active_ = false;
 
     return *this;
 }
 
-MainContext::WatchdogGuard MainContext::register_watchdog(HostBridge& bridge) {
+MainContext::WatchdogGuard MainContext::register_watchdog(HostBridge& bridge,
+                                                          pid_t parent_pid) {
     // The guard's constructor and destructor will handle actually registering
-    // and unregistering the bridge from `watched_bridges`
-    return WatchdogGuard(bridge, watched_bridges_, watched_bridges_mutex_);
+    // and unregistering the bridge from `watched_bridges_` and
+    // `pidfd_watches_`.
+    return WatchdogGuard(bridge, *this, parent_pid);
+}
+
+void MainContext::unregister_watchdog(HostBridge& bridge) noexcept {
+    std::lock_guard lock(watched_bridges_mutex_);
+    watched_bridges_.erase(&bridge);
+    // Erasing the pidfd_watches_ entry destroys the stream_descriptor,
+    // which cancels any pending async_wait (the handler fires once
+    // with operation_aborted; our handler early-returns on that) and
+    // closes the underlying pidfd.
+    pidfd_watches_.erase(&bridge);
 }
 
 void MainContext::async_handle_watchdog_timer(

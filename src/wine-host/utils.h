@@ -21,11 +21,13 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <windows.h>
 #include <asio/dispatch.hpp>
 #include <asio/io_context.hpp>
+#include <asio/posix/stream_descriptor.hpp>
 #include <function2/function2.hpp>
 
 #include "../common/utils.h"
@@ -188,9 +190,10 @@ class MainContext {
      */
     class WatchdogGuard {
        public:
-        WatchdogGuard(HostBridge& bridge,
-                      std::unordered_set<HostBridge*>& watched_bridges,
-                      std::mutex& watched_bridges_mutex);
+        // NSPA: ctor inserts into both watched_bridges_ and (best-effort)
+        // pidfd_watches_; dtor erases from both via main_context.
+        WatchdogGuard(HostBridge& bridge, MainContext& main_context,
+                      pid_t parent_pid);
         ~WatchdogGuard() noexcept;
 
         WatchdogGuard(const WatchdogGuard&) = delete;
@@ -212,11 +215,8 @@ class MainContext {
          */
         HostBridge* bridge_;
 
-        // References to the same two fields on `MainContext`, so we don't have
-        // to use `friend`
-        std::reference_wrapper<std::unordered_set<HostBridge*>>
-            watched_bridges_;
-        std::reference_wrapper<std::mutex> watched_bridges_mutex_;
+        // Reference to MainContext for unregister via friend-free path.
+        std::reference_wrapper<MainContext> main_context_;
     };
 
     /**
@@ -226,8 +226,15 @@ class MainContext {
      * prevent dangling processes. The returned guard should be stored as a
      * field in `HostBridge`, and the watchdog will automatically be
      * unregistered once this guard drops from scope.
+     *
+     * NSPA: we also open a pidfd on `parent_pid` and async-wait on it via
+     * `watchdog_context_`. When the parent process exits, the kernel
+     * marks the pidfd readable immediately; the handler fires
+     * `shutdown_if_dangling()` on the bridge with zero polling latency.
+     * The 30s timer above stays as a fallback for kernels too old to
+     * support pidfd_open or any other failure mode.
      */
-    WatchdogGuard register_watchdog(HostBridge& bridge);
+    WatchdogGuard register_watchdog(HostBridge& bridge, pid_t parent_pid);
 
     /**
      * Returns `true` if the calling thread is the GUI thread, aka the thread
@@ -360,6 +367,22 @@ class MainContext {
      */
     std::unordered_set<HostBridge*> watched_bridges_;
     std::mutex watched_bridges_mutex_;
+
+    // NSPA: pidfd-based event-driven shortcut. Open a pidfd per bridge
+    // on its parent_pid, async_wait on POLLIN; when the kernel signals
+    // the parent has exited, fire shutdown_if_dangling immediately
+    // instead of waiting up to 30s for the polling timer. Map and the
+    // descriptor lifecycle are guarded by watched_bridges_mutex_. The
+    // map can be empty for individual bridges (kernel < 5.3 lacks
+    // pidfd_open or any other failure) — the 30s polling above still
+    // covers those cases.
+    std::unordered_map<HostBridge*, asio::posix::stream_descriptor>
+        pidfd_watches_;
+
+    // Called by WatchdogGuard's destructor — removes a bridge from
+    // both watched_bridges_ and pidfd_watches_.
+    void unregister_watchdog(HostBridge& bridge) noexcept;
+    friend class WatchdogGuard;
 
     /**
      * The thread where we run our watchdog timer, to shut down plugins after

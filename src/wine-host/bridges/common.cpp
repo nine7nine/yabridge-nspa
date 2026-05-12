@@ -55,7 +55,7 @@ HostBridge::HostBridge(MainContext& main_context,
       main_context_(main_context),
       generic_logger_(Logger::create_wine_stderr()),
       parent_pid_(parent_pid),
-      watchdog_guard_(main_context.register_watchdog(*this)) {}
+      watchdog_guard_(main_context.register_watchdog(*this, parent_pid)) {}
 
 void HostBridge::handle_events() noexcept {
     MSG msg;
