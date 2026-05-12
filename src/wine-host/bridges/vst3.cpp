@@ -174,35 +174,39 @@ void Vst3Bridge::run() {
                                 Steinberg::IPtr<Steinberg::FUnknown> result;
 
                                 // The plugin may spawn audio worker threads
-                                // when constructing an object. Since Wine
-                                // doesn't implement Window's realtime process
-                                // priority yet we'll just have to make sure the
-                                // any spawned threads are running with
-                                // `SCHED_FIFO` ourselves.
-                                set_realtime_priority(true);
-                                switch (request.requested_interface) {
-                                    case Vst3PluginProxy::Construct::Interface::
-                                        IComponent:
-                                        result =
-                                            module_->getFactory()
-                                                .createInstance<
-                                                    Steinberg::Vst::IComponent>(
-                                                    cid);
-                                        break;
-                                    case Vst3PluginProxy::Construct::Interface::
-                                        IEditController:
-                                        result =
-                                            module_->getFactory()
-                                                .createInstance<
-                                                    Steinberg::Vst::
-                                                        IEditController>(cid);
-                                        break;
-                                    default:
-                                        // Unreachable
-                                        result = nullptr;
-                                        break;
+                                // when constructing an object. Boost the
+                                // caller to TIME_CRITICAL so spawned threads
+                                // inherit RT scheduling via the kernel's
+                                // pthread_create default inherit-sched; the
+                                // RAII helper restores the caller's prior
+                                // priority on scope exit.
+                                {
+                                    yabridge::nspa::ScopedTimeCriticalBoost
+                                        boost;
+                                    switch (request.requested_interface) {
+                                        case Vst3PluginProxy::Construct::
+                                            Interface::IComponent:
+                                            result =
+                                                module_->getFactory()
+                                                    .createInstance<
+                                                        Steinberg::Vst::
+                                                            IComponent>(cid);
+                                            break;
+                                        case Vst3PluginProxy::Construct::
+                                            Interface::IEditController:
+                                            result =
+                                                module_->getFactory()
+                                                    .createInstance<
+                                                        Steinberg::Vst::
+                                                            IEditController>(
+                                                        cid);
+                                            break;
+                                        default:
+                                            // Unreachable
+                                            result = nullptr;
+                                            break;
+                                    }
                                 }
-                                set_realtime_priority(false);
 
                                 return result;
                             })
@@ -1170,14 +1174,16 @@ void Vst3Bridge::run() {
 
                         // The plugin may try to spawn audio worker threads
                         // during its initialization
-                        set_realtime_priority(true);
-                        // This static cast is required to upcast to
-                        // `FUnknown*`
-                        const tresult result =
-                            instance.interfaces.plugin_base->initialize(
-                                static_cast<YaHostApplication*>(
-                                    instance.host_context_proxy));
-                        set_realtime_priority(false);
+                        tresult result;
+                        {
+                            yabridge::nspa::ScopedTimeCriticalBoost boost;
+                            // This static cast is required to upcast to
+                            // `FUnknown*`
+                            result =
+                                instance.interfaces.plugin_base->initialize(
+                                    static_cast<YaHostApplication*>(
+                                        instance.host_context_proxy));
+                        }
 
                         // HACK: Waves plugins for some reason only add
                         //       `IEditController` to their query interface

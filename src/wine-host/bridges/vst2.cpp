@@ -198,12 +198,15 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     current_bridge_instance = this;
 
     // We'll also need to make sure that any audio worker threads created by the
-    // plugin are running using realtime scheduling, since Wine doesn't fully
-    // implement the Win32 process priority API yet.
-    set_realtime_priority(true);
-    plugin_ = vst_entry_point(
-        reinterpret_cast<audioMasterCallback>(host_callback_proxy));
-    set_realtime_priority(false);
+    // plugin are running using realtime scheduling. Under Wine-NSPA, routing
+    // through SetThreadPriority(TIME_CRITICAL) lets nspa_rt_apply_tid handle
+    // the SCHED_FIFO promotion at the NSPA-configured band; under vanilla
+    // Wine the existing Win32 → nice mapping applies.
+    {
+        yabridge::nspa::ScopedTimeCriticalBoost boost;
+        plugin_ = vst_entry_point(
+            reinterpret_cast<audioMasterCallback>(host_callback_proxy));
+    }
 
     if (!plugin_) {
         throw std::runtime_error("VST plugin at '" + plugin_dll_path +
@@ -446,22 +449,24 @@ void Vst2Bridge::run() {
                     // Win32 message loop is handled.
                     if (unsafe_requests.contains(opcode)) {
                         // Requests that potentially spawn an audio worker
-                        // thread should be run with `SCHED_FIFO` until Wine
-                        // implements the corresponding Windows API
+                        // thread should be run with `SCHED_FIFO` so spawned
+                        // workers inherit RT scheduling.
                         const bool is_realtime_request =
                             unsafe_requests_realtime.contains(opcode);
 
                         return main_context_
                             .run_in_context([&]() -> intptr_t {
-                                if (is_realtime_request) {
-                                    set_realtime_priority(true);
-                                }
-
-                                const intptr_t result = dispatch_wrapper(
-                                    plugin, opcode, index, value, data, option);
-
-                                if (is_realtime_request) {
-                                    set_realtime_priority(false);
+                                intptr_t result;
+                                {
+                                    std::optional<
+                                        yabridge::nspa::ScopedTimeCriticalBoost>
+                                        boost;
+                                    if (is_realtime_request) {
+                                        boost.emplace();
+                                    }
+                                    result = dispatch_wrapper(
+                                        plugin, opcode, index, value, data,
+                                        option);
                                 }
 
                                 // The Win32 message loop will not be run up to
