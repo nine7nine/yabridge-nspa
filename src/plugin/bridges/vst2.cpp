@@ -186,13 +186,15 @@ Vst2PluginBridge::Vst2PluginBridge(const ghc::filesystem::path& plugin_path,
         std::get<std::string>(*initialization_data.value_payload);
     warn_on_version_mismatch(host_version);
 
-    // L2 — optional pi_cond+pi_mutex audio rendezvous (YABRIDGE_NSPA opt-in).
-    // MUST run BEFORE sending the Configuration so the wine-host receives the
-    // shmem name and can attach deterministically. If creation fails or env
-    // is unset, config_.audio_control_shm_name stays nullopt and both sides
-    // transparently use the existing socket transport.
-    if (const char* nspa_env = getenv("YABRIDGE_NSPA");
-        nspa_env && nspa_env[0] != '\0' && nspa_env[0] != '0') {
+    // L2 — pi_cond+pi_mutex audio rendezvous. Always-on for Wine-NSPA's
+    // yabridge fork: there's no behavioral reason to opt out for normal
+    // operation. On any creation failure (e.g. /dev/shm permissions,
+    // stale region from a crashed predecessor, edge cases) we silently
+    // fall back to the existing socket transport — the entire L2 path
+    // is gated on `config_.audio_control_shm_name` being set on both
+    // sides. MUST run BEFORE sending Configuration so the wine-host
+    // receives the shmem name and can attach deterministically.
+    {
         // Derive a deterministic shmem name from the socket base directory.
         // shm_open names start with `/` and cannot contain other `/`.
         // Sanitize chars like `(`, `)` (from plugin names like "Zebra2(x64)")
@@ -211,8 +213,8 @@ Vst2PluginBridge::Vst2PluginBridge(const ghc::filesystem::path& plugin_path,
             config_.audio_control_shm_name = shm_name;
         } catch (const std::exception& e) {
             Logger logger = Logger::create_exception_logger();
-            logger.log(std::string("YABRIDGE_NSPA set but pi_cond audio "
-                                   "rendezvous setup failed: ") +
+            logger.log(std::string("L2 pi_cond audio rendezvous setup "
+                                   "failed: ") +
                        e.what() + " — falling back to socket transport.");
             // config_.audio_control_shm_name remains nullopt
         }
