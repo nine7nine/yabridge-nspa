@@ -17,7 +17,9 @@
 #include "vst3.h"
 
 #include <bitset>
+#include <optional>
 
+#include "../nspa_rt.h"
 #include "vst3-impls/component-handler-proxy.h"
 #include "vst3-impls/connection-point-proxy.h"
 #include "vst3-impls/context-menu-proxy.h"
@@ -124,7 +126,7 @@ bool Vst3Bridge::inhibits_event_loop() noexcept {
 }
 
 void Vst3Bridge::run() {
-    set_realtime_priority(true);
+    yabridge::nspa::set_thread_time_critical();
 
     sockets_.host_plugin_control_.receive_messages(
         std::nullopt,
@@ -1724,7 +1726,7 @@ size_t Vst3Bridge::register_object_instance(
 
         object_instances_.at(instance_id)
             .audio_processor_handler = Win32Thread([&, instance_id]() {
-            set_realtime_priority(true);
+            yabridge::nspa::set_thread_time_critical();
 
             // XXX: Like with VST2 worker threads, when using plugin groups the
             //      thread names from different plugins will clash. Not a huge

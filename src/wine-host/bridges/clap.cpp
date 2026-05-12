@@ -18,11 +18,14 @@
 
 #include <codecvt>
 #include <locale>
+#include <optional>
 
 #include <clap/factory/plugin-factory.h>
 
 // Generated inside of the build directory
 #include <version.h>
+
+#include "../nspa_rt.h"
 
 namespace fs = ghc::filesystem;
 
@@ -172,7 +175,7 @@ bool ClapBridge::inhibits_event_loop() noexcept {
 }
 
 void ClapBridge::run() {
-    set_realtime_priority(true);
+    yabridge::nspa::set_thread_time_critical();
 
     sockets_.host_plugin_main_thread_control_.receive_messages(
         std::nullopt,
@@ -1063,7 +1066,7 @@ void ClapBridge::register_plugin_instance(
     std::promise<void> socket_listening_latch;
     object_instances_.at(instance_id)
         .audio_thread_handler = Win32Thread([&, instance_id]() {
-        set_realtime_priority(true);
+        yabridge::nspa::set_thread_time_critical();
 
         // XXX: Like with VST2 worker threads, when using plugin groups the
         //      thread names from different plugins will clash. Not a huge

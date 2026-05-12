@@ -17,12 +17,14 @@
 #include "vst2.h"
 
 #include <iostream>
+#include <optional>
 #include <set>
 
 // Generated inside of the build directory
 #include <version.h>
 
 #include "../../common/communication/vst2.h"
+#include "../nspa_rt.h"
 
 /**
  * A function pointer to what should be the entry point of a VST plugin.
@@ -233,7 +235,7 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     main_context.update_timer_interval(config_.event_loop_interval());
 
     parameters_handler_ = Win32Thread([&]() {
-        set_realtime_priority(true);
+        yabridge::nspa::set_thread_time_critical();
         pthread_setname_np(pthread_self(), "parameters");
 
         sockets_.host_plugin_parameters_.receive_multi<Parameter>(
@@ -260,7 +262,7 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     });
 
     process_replacing_handler_ = Win32Thread([&]() {
-        set_realtime_priority(true);
+        yabridge::nspa::set_thread_time_critical();
         pthread_setname_np(pthread_self(), "audio");
 
         // Most plugins will already enable FTZ, but there are a handful of
@@ -390,7 +392,7 @@ bool Vst2Bridge::inhibits_event_loop() noexcept {
 }
 
 void Vst2Bridge::run() {
-    set_realtime_priority(true);
+    yabridge::nspa::set_thread_time_critical();
 
     sockets_.host_plugin_dispatch_.receive_events(
         std::nullopt,
