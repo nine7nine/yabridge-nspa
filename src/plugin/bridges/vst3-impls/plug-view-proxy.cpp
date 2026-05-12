@@ -60,9 +60,15 @@ void RunLoopTasks::schedule(fu2::unique_function<void()> task) {
     std::lock_guard eventfd_lock(tasks_mutex_);
     tasks_.push_back(std::move(task));
 
+    // write() must run unconditionally — under -DNDEBUG, assert() expands
+    // to ((void)0) and the wrapped expression is never evaluated; the
+    // notify byte would never be written and the GUI thread would never
+    // be woken to run the scheduled task.
     uint8_t notify_value = 1;
-    assert(write(socket_write_fd_, &notify_value, sizeof(notify_value)) ==
-           sizeof(notify_value));
+    const ssize_t write_rc =
+        write(socket_write_fd_, &notify_value, sizeof(notify_value));
+    assert(write_rc == sizeof(notify_value));
+    (void)write_rc;
 }
 
 void PLUGIN_API
@@ -77,9 +83,14 @@ RunLoopTasks::onFDIsSet(Steinberg::Linux::FileDescriptor /*fd*/) {
         // This should in theory stop the host from calling this function, but
         // REAPER doesn't care. And funnily enough we only have to do all of
         // this because of REAPER.
+        //
+        // read() must run unconditionally — see the comment on the
+        // corresponding write() in RunLoopTasks::schedule().
         uint8_t notify_value;
-        assert(read(socket_read_fd_, &notify_value, sizeof(notify_value)) ==
-               sizeof(notify_value));
+        const ssize_t read_rc =
+            read(socket_read_fd_, &notify_value, sizeof(notify_value));
+        assert(read_rc == sizeof(notify_value));
+        (void)read_rc;
     }
 
     tasks_.clear();

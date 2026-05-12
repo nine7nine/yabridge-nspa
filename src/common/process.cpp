@@ -251,8 +251,14 @@ Process::Process(std::string command) : command_(command) {}
 Process::StringResult Process::spawn_get_stdout_line() const {
     // We'll read the results from a pipe. The child writes to the second pipe,
     // we'll read from the first one.
+    //
+    // The pipe() call must run unconditionally, NOT wrapped in assert().
+    // Under -DNDEBUG, assert() expands to ((void)0) and pipe() is never
+    // called — stdout_pipe_fds would stay uninitialized.
     int stdout_pipe_fds[2];
-    assert(pipe(stdout_pipe_fds) == 0);
+    const int pipe_rc = pipe(stdout_pipe_fds);
+    assert(pipe_rc == 0);
+    (void)pipe_rc;
 
     const auto argv = build_argv();
     const auto envp = env_ ? env_->make_environ() : environ;
@@ -287,19 +293,34 @@ Process::StringResult Process::spawn_get_stdout_line() const {
         fgets(output.data(), output.size(), output_pipe_stream);
     fclose(output_pipe_stream);
 
+    // The waitpid call must run unconditionally, NOT wrapped in assert().
+    // Under -DNDEBUG, assert() expands to ((void)0) and the wrapped
+    // expression is never evaluated — the child would become a zombie until
+    // reaped by init.
+    //
+    // waitpid can also legitimately return -1 with errno==ECHILD when the
+    // host application (e.g. Element) installs its own SIGCHLD handler that
+    // reaps grandchild processes before we get here. Treat that as success:
+    // the child has already exited and we've already captured its stdout
+    // above via fgets.
     int status = 0;
-    assert(waitpid(child_pid, &status, 0) > 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) == 127) {
+    const pid_t waited = waitpid(child_pid, &status, 0);
+    if (waited > 0 && (!WIFEXITED(status) || WEXITSTATUS(status) == 127)) {
         return Process::CommandNotFound{};
-    } else {
-        // `fgets()` returns the line feed, so we'll get rid of that
-        std::string output_str(output.data());
-        if (output_str.back() == '\n') {
-            output_str.pop_back();
-        }
-
-        return output_str;
     }
+
+    // waited <= 0  → child already reaped by host's SIGCHLD handler (e.g.
+    //                Element's). Treat as success — stdout was already
+    //                captured by fgets above.
+    // waited >  0  → WIFEXITED && exit code != 127 (normal completion).
+
+    // `fgets()` returns the line feed, so we'll get rid of that
+    std::string output_str(output.data());
+    if (output_str.back() == '\n') {
+        output_str.pop_back();
+    }
+
+    return output_str;
 }
 
 Process::StatusResult Process::spawn_get_status() const {
@@ -315,10 +336,16 @@ Process::StatusResult Process::spawn_get_status() const {
         return std::error_code(result, std::system_category());
     }
 
+    // See the analogous comment in spawn_get_stdout_line() — waitpid must
+    // not be wrapped in assert() because -DNDEBUG would skip the call.
     int status = 0;
-    assert(waitpid(child_pid, &status, 0) > 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) == 127) {
+    const pid_t waited = waitpid(child_pid, &status, 0);
+    if (waited > 0 && (!WIFEXITED(status) || WEXITSTATUS(status) == 127)) {
         return Process::CommandNotFound{};
+    } else if (waited <= 0) {
+        // Child reaped by host SIGCHLD handler; we have no exit status to
+        // return. Treat as exit code 0 (success).
+        return 0;
     } else {
         return WEXITSTATUS(status);
     }
@@ -376,10 +403,15 @@ Process::HandleResult Process::spawn_child_piped(
     // passed to this function so they can be read from asynchronously in an
     // Asio IO context loop. We'll read from the first elements of these pipes,
     // and the child process will write to the second elements.
+    // See spawn_get_stdout_line — pipe() must run unconditionally.
     int stdout_pipe_fds[2];
     int stderr_pipe_fds[2];
-    assert(pipe(stdout_pipe_fds) == 0);
-    assert(pipe(stderr_pipe_fds) == 0);
+    const int stdout_pipe_rc = pipe(stdout_pipe_fds);
+    const int stderr_pipe_rc = pipe(stderr_pipe_fds);
+    assert(stdout_pipe_rc == 0);
+    assert(stderr_pipe_rc == 0);
+    (void)stdout_pipe_rc;
+    (void)stderr_pipe_rc;
 
     const auto argv = build_argv();
     const auto envp = env_ ? env_->make_environ() : environ;
@@ -416,8 +448,12 @@ Process::HandleResult Process::spawn_child_piped(
     // exist, but the specification says that it should return a PID that exits
     // with status 127 instead. I have no idea how we'd check for that without
     // waiting here though, so this check may not work
+    //
+    // waitpid() must run unconditionally — see spawn_get_stdout_line.
     int status = 0;
-    assert(waitpid(child_pid, &status, WNOHANG) >= 0);
+    const pid_t waited_rc = waitpid(child_pid, &status, WNOHANG);
+    assert(waited_rc >= 0);
+    (void)waited_rc;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
         return Process::CommandNotFound{};
     } else {
@@ -448,8 +484,11 @@ Process::HandleResult Process::spawn_child_redirected(
         return std::error_code(result, std::system_category());
     }
 
+    // waitpid() must run unconditionally — see spawn_get_stdout_line.
     int status = 0;
-    assert(waitpid(child_pid, &status, WNOHANG) >= 0);
+    const pid_t waited_rc = waitpid(child_pid, &status, WNOHANG);
+    assert(waited_rc >= 0);
+    (void)waited_rc;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
         return Process::CommandNotFound{};
     } else {

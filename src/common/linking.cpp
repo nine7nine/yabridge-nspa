@@ -29,10 +29,22 @@ fs::path get_this_file_location() {
     // the plugin libraries cannot use this function directly when using the
     // chainloaders.
 
-    // On success this returns a non-zero value, just to keep you on your toes
+    // On success this returns a non-zero value, just to keep you on your toes.
+    //
+    // The dladdr call must run unconditionally, NOT wrapped in assert().
+    // Under -DNDEBUG, assert() expands to ((void)0) and the wrapped
+    // expression is never evaluated — `info` would remain uninitialized and
+    // the std::string construction below would read garbage as a char*.
     Dl_info info;
-    assert(dladdr(reinterpret_cast<void*>(get_this_file_location), &info) != 0);
-    assert(info.dli_fname);
+    const int dladdr_rc =
+        dladdr(reinterpret_cast<void*>(get_this_file_location), &info);
+    if (dladdr_rc == 0 || !info.dli_fname) {
+        // Should never happen: we're passing a function pointer that's
+        // definitely inside a loaded library. If it does, return an empty
+        // path rather than dereferencing garbage.
+        assert(false && "dladdr failed unexpectedly for this library");
+        return {};
+    }
 
     std::string this_file(info.dli_fname);
 

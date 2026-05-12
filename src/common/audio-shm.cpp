@@ -78,8 +78,13 @@ void AudioShmBuffer::setup_mapping() {
     // Apparently you get a `Resource temporarily unavailable` when calling
     // `ftruncate()` with a size of 0 on shared memory
     if (config_.size > 0) {
-        // I don't think this can fail
-        assert(ftruncate(shm_fd_, config_.size) == 0);
+        // The ftruncate call must run unconditionally, NOT wrapped in
+        // assert(). Under -DNDEBUG, assert() expands to ((void)0) and the
+        // wrapped expression is never evaluated — the shmem region would
+        // stay sized 0 and all subsequent audio I/O would be undefined.
+        const int ftruncate_rc = ftruncate(shm_fd_, config_.size);
+        assert(ftruncate_rc == 0);
+        (void)ftruncate_rc;  // suppress unused-variable under NDEBUG
 
         // But this can, if the user does not have permissions to use (enough)
         // locked emmory, we'll try it without locking memory and show a big
@@ -104,7 +109,9 @@ void AudioShmBuffer::setup_mapping() {
             // Growing into a size that we cannot lock sounds like a super rare
             // edge case, but let's handle it anyways
             if (old_shm_bytes) {
-                assert(munmap(old_shm_bytes, shm_size_) == 0);
+                const int munmap_rc = munmap(old_shm_bytes, shm_size_);
+                assert(munmap_rc == 0);
+                (void)munmap_rc;
             }
             shm_bytes_ = static_cast<uint8_t*>(mmap(nullptr, config_.size,
                                                     PROT_READ | PROT_WRITE,
