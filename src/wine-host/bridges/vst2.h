@@ -24,6 +24,7 @@
 #include "../../common/communication/vst2.h"
 #include "../../common/configuration.h"
 #include "../../common/mutual-recursion.h"
+#include "../../common/pi_sync.h"
 #include "../editor.h"
 #include "common.h"
 
@@ -251,9 +252,13 @@ class Vst2Bridge : public HostBridge {
     bool should_clear_midi_events_ = false;
     /**
      * Mutex for locking the above event queue, since recieving and processing
-     * now happens in two different threads.
+     * now happens in two different threads. PI-aware so the audio thread
+     * (SCHED_FIFO at NSPA_RT_PRIO) cannot get blocked behind a lower-priority
+     * holder without priority boost — relevant when the event_handler thread
+     * is contended by other host activity. Drop-in for std::mutex via the
+     * BasicLockable concept (std::lock_guard accepts either).
      */
-    std::mutex next_buffer_midi_events_mutex_;
+    yabridge::nspa::PiMutex next_buffer_midi_events_mutex_;
 
     /**
      * Used to allow the responses to host callbacks to be handled on the same
