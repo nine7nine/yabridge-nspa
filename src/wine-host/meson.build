@@ -63,6 +63,7 @@ host_sources = files(
   '../common/logging/common.cpp',
   '../common/logging/vst2.cpp',
   '../common/audio-shm.cpp',
+  '../common/audio-control-shm.cpp',
   '../common/plugins.cpp',
   '../common/process.cpp',
   '../common/utils.cpp',

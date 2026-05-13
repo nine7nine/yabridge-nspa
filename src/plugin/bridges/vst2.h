@@ -21,6 +21,7 @@
 #include <asio/io_context.hpp>
 #include <thread>
 
+#include "../../common/audio-control-shm.h"
 #include "../../common/communication/vst2.h"
 #include "../../common/logging/vst2.h"
 #include "common.h"
@@ -172,6 +173,35 @@ class Vst2PluginBridge : PluginBridge<Vst2Sockets<std::jthread>> {
      * This will be a nullopt until `effMainsChanged` has been called.
      */
     std::optional<AudioShmBuffer> process_buffers_;
+
+    /**
+     * Optional pi_cond+pi_mutex shmem rendezvous for the audio request/
+     * reply round-trip (L2). Created in the constructor when
+     * YABRIDGE_NSPA env var is set; nullopt otherwise (fall back to the
+     * existing host_plugin_process_replacing_ socket transport). The
+     * wine-host side attaches to the same shmem region via the name
+     * carried in Configuration.audio_control_shm_name (deterministic
+     * handshake — no constructor race).
+     */
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm_;
+
+    /**
+     * Preallocated serialization buffers for the L2 pi_cond audio path.
+     *
+     * RT contract: the audio thread MUST NOT heap-allocate.
+     * SerializationBuffer<N> is llvm::SmallVector<uint8_t, N> with N
+     * bytes of INLINE storage. At N = audio_control_buf_size (64 KiB),
+     * no heap allocation occurs for any plausible payload — the audio
+     * request is ~100 B, the Ack reply is 0 B. Both buffers live as
+     * Vst2PluginBridge members so they're allocated once at bridge
+     * construction (not lazy-on-first-use, which was a v1 RT
+     * violation that may have triggered Carla to disable MIDI
+     * dispatch).
+     */
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_buf_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_buf_;
 
     /**
      * The VST host can query a plugin for arbitrary binary data such as

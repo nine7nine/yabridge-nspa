@@ -18,9 +18,13 @@
 
 #include "../use-linux-asio.h"
 
+#include <atomic>
+
 #include <vestige/aeffectx.h>
 #include <windows.h>
 
+#include "../../common/audio-control-shm.h"
+#include "../../common/communication/common.h"  // for SerializationBuffer<N>
 #include "../../common/communication/vst2.h"
 #include "../../common/configuration.h"
 #include "../../common/mutual-recursion.h"
@@ -59,6 +63,22 @@ class Vst2Bridge : public HostBridge {
                std::string plugin_dll_path,
                std::string endpoint_base_dir,
                pid_t parent_pid);
+
+    /**
+     * Explicit destructor — needed for L2 to send the shutdown signal
+     * to the pi_cond audio thread BEFORE implicit member destruction
+     * begins. Without this, process_replacing_handler_'s Win32Thread
+     * destructor would block forever joining a thread parked in
+     * pi_cond_wait. The body of this destructor calls
+     * audio_control_shm_->signal_shutdown(), which broadcasts both
+     * cond vars; the audio thread wakes, observes Shutdown state,
+     * throws AudioControlShutdown, and exits its loop. Then implicit
+     * member destruction proceeds in reverse-of-declaration order:
+     * sockets_ closes → parameters_handler_ joins → process_replacing_
+     * handler_ joins (audio thread already exited) → ... →
+     * audio_control_shm_ destructs (safe, no thread using it).
+     */
+    ~Vst2Bridge() noexcept;
 
     bool inhibits_event_loop() noexcept override;
 
@@ -201,6 +221,48 @@ class Vst2Bridge : public HostBridge {
      * `HostBridge::inhibits_event_loop` to work around a bug in T-RackS 5.
      */
     bool is_initialized_ = false;
+
+    /**
+     * L2 — optional pi_cond+pi_mutex shmem rendezvous for audio
+     * request/reply. Set in the constructor if the plugin-lib side
+     * created one (signaled via Configuration.audio_control_shm_name);
+     * stays nullopt otherwise (socket fallback).
+     *
+     * MUST be declared HERE — BEFORE the Win32Thread members — so that
+     * reverse-of-declaration destruction order destructs the shmem
+     * AFTER the Win32Thread destructor has joined the audio thread.
+     * If declared after the Win32Thread, the shmem would unmap while
+     * the audio thread is still parked in pi_cond_wait on it, hanging
+     * the join forever. This was the v1 bug, fixed by reordering here.
+     *
+     * Pre-sized inline storage so the audio thread never heap-allocates
+     * (RT contract). Each buffer is 64 KiB inline storage; no heap
+     * activity for any plausible Vst2ProcessRequest or Ack.
+     */
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_local_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_local_;
+
+    /**
+     * Flag set during teardown to break the pi_cond audio loop.
+     * `~Vst2Bridge` sets this and calls audio_control_shm_->signal_shutdown
+     * (broadcasts both cond vars) before any implicit member destruction
+     * begins. The audio thread then observes either the atomic at the
+     * top of its loop OR the Shutdown state inside audio_control_recv_one,
+     * and exits.
+     */
+    std::atomic<bool> audio_loop_stop_{false};
+
+    /**
+     * Per-callback handler extracted from the original
+     * `process_replacing_handler_` inline lambda body. Reused by both
+     * the socket transport (receive_multi callback) and the pi_cond
+     * transport (audio_control_recv_one handler). Identical semantics
+     * to the original — verbatim extraction, no logic change.
+     */
+    Ack handle_process_replacing(Vst2ProcessRequest& process_request);
 
     /**
      * The thread that responds to `getParameter` and `setParameter` requests.

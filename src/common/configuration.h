@@ -165,6 +165,19 @@ class Configuration {
     std::vector<std::string> unknown_options;
 
     /**
+     * NSPA-specific runtime field (NOT a user-config option). When set,
+     * names a process-shared shmem region the plugin-lib side has
+     * already created (via AudioControlShm::Create) that the wine-host
+     * side should attempt to attach to for L2 pi_cond audio transport.
+     * Left at nullopt by default — only populated by Vst2PluginBridge
+     * when YABRIDGE_NSPA env is set AND the shmem create succeeded.
+     * Stays nullopt for stock yabridge or when L2 falls back to
+     * socket transport. Wire-format: `bitsery::ext::InPlaceOptional`
+     * over `text1b(name, 4096)`.
+     */
+    std::optional<std::string> audio_control_shm_name;
+
+    /**
      * The delay in milliseconds between calls to the event loop and to
      * `effEditIdle` for VST2 plugins. This is based on `frame_rate`.
      */
@@ -193,5 +206,15 @@ class Configuration {
                     [](S& s, auto& v) { s.text1b(v, 4096); });
         s.container(unknown_options, 1024,
                     [](S& s, auto& v) { s.text1b(v, 4096); });
+
+        // NSPA L2: shmem name for the pi_cond audio rendezvous, if
+        // plugin-lib created one. Optional — absent on the wire when
+        // not set, so vanilla yabridge clients/hosts that don't know
+        // about it still parse the rest of the message correctly...
+        // EXCEPT bitsery wire format is positional, not tagged. Both
+        // sides MUST have this field at the same offset. Our build
+        // always emits + always parses; no interop with stock yabridge.
+        s.ext(audio_control_shm_name, bitsery::ext::InPlaceOptional(),
+              [](S& s, auto& v) { s.text1b(v, 4096); });
     }
 };

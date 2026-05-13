@@ -186,6 +186,44 @@ Vst2PluginBridge::Vst2PluginBridge(const ghc::filesystem::path& plugin_path,
         std::get<std::string>(*initialization_data.value_payload);
     warn_on_version_mismatch(host_version);
 
+    // L2 — optional pi_cond+pi_mutex audio rendezvous (YABRIDGE_NSPA opt-in).
+    // MUST run BEFORE sending the Configuration so the wine-host receives the
+    // shmem name and can attach deterministically. If creation fails or env
+    // is unset, config_.audio_control_shm_name stays nullopt and both sides
+    // transparently use the existing socket transport.
+    if (const char* nspa_env = getenv("YABRIDGE_NSPA");
+        nspa_env && nspa_env[0] != '\0' && nspa_env[0] != '0') {
+        // Derive a deterministic shmem name from the socket base directory.
+        // shm_open names start with `/` and cannot contain other `/`.
+        // Sanitize chars like `(`, `)` (from plugin names like "Zebra2(x64)")
+        // to underscores for portability across libc implementations.
+        std::string token = sockets_.base_dir_.filename().string();
+        for (char& c : token) {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+                  c == '-' || c == '_' || c == '.')) {
+                c = '_';
+            }
+        }
+        const std::string shm_name = "/" + token + ".audio_ctl";
+        try {
+            audio_control_shm_.emplace(
+                yabridge::nspa::AudioControlShm::Create{}, shm_name);
+            config_.audio_control_shm_name = shm_name;
+        } catch (const std::exception& e) {
+            Logger logger = Logger::create_exception_logger();
+            logger.log(std::string("YABRIDGE_NSPA set but pi_cond audio "
+                                   "rendezvous setup failed: ") +
+                       e.what() + " — falling back to socket transport.");
+            // config_.audio_control_shm_name remains nullopt
+        }
+    }
+
+    // Pre-size the reply receive buffer to full capacity. quickSerialization
+    // on the request side will resize pi_cond_req_buf_ as needed (within the
+    // inline 64 KiB), but the reply receive needs writable space for
+    // audio_control_send_and_wait's memcpy into our buffer's .data().
+    pi_cond_reply_buf_.resize(yabridge::nspa::audio_control_buf_size);
+
     // After receiving the `AEffect` values we'll want to send the configuration
     // back to complete the startup process
     sockets_.host_plugin_control_.send(config_);
@@ -681,12 +719,60 @@ void Vst2PluginBridge::do_process(T** inputs, T** outputs, int sample_frames) {
     // After writing audio to the shared memory buffers, we'll send the
     // processing request parameters to the Wine plugin host so it can start
     // processing audio. This is why we don't need any explicit synchronisation.
-    sockets_.host_plugin_process_replacing_.send(request);
+    if (audio_control_shm_) [[likely]] {
+        // L2 — pi_cond+pi_mutex audio round-trip with cross-process PI.
+        // Plugin-lib serializes the request into the preallocated inline
+        // buffer (no heap activity), the rendezvous helper memcpys it to
+        // the shmem slot, signals the consumer, waits for the reply, and
+        // memcpys the reply back. The wine-host audio worker runs at PI-
+        // boosted priority for the duration of the callback.
+        //
+        // quickSerialization writes into pi_cond_req_buf_ (resizes within
+        // the inline 64 KiB; no heap). Returns the size written.
+        const size_t req_size = bitsery::quickSerialization<
+            OutputAdapter<SerializationBufferBase>>(pi_cond_req_buf_, request);
 
-    // From the Wine side we'll send a zero byte struct back as an
-    // acknowledgement that audio processing has finished. At this point the
-    // audio will have been written to our buffers.
-    sockets_.host_plugin_process_replacing_.receive_single<Ack>();
+        size_t reply_size = 0;
+        try {
+            yabridge::nspa::audio_control_send_and_wait(
+                *audio_control_shm_,
+                pi_cond_req_buf_.data(), req_size,
+                pi_cond_reply_buf_.data(),
+                yabridge::nspa::audio_control_buf_size,
+                reply_size);
+
+            // Deserialize the Ack reply (zero-byte struct, sanity check
+            // on the wire format more than data extraction).
+            Ack ack;
+            auto [_, ok] = bitsery::quickDeserialization<
+                InputAdapter<SerializationBufferBase>>(
+                {pi_cond_reply_buf_.begin(), reply_size}, ack);
+            if (!ok) [[unlikely]] {
+                throw std::runtime_error(
+                    "L2 Ack deserialization failed");
+            }
+        } catch (const std::overflow_error&) {
+            // Payload exceeded 64 KiB shmem slot — fall back to socket
+            // for this one callback. Shouldn't happen for VST2 process
+            // requests in practice, but defensive.
+            sockets_.host_plugin_process_replacing_.send(request);
+            sockets_.host_plugin_process_replacing_.receive_single<Ack>();
+        } catch (const yabridge::nspa::AudioControlShutdown&) {
+            // Bridge teardown signaled mid-callback. The wine-host
+            // process is going away. Fall back so this final callback
+            // (if any) still completes; the socket may also be closing
+            // but that fails gracefully at the SocketHandler level.
+            sockets_.host_plugin_process_replacing_.send(request);
+            sockets_.host_plugin_process_replacing_.receive_single<Ack>();
+        }
+    } else {
+        sockets_.host_plugin_process_replacing_.send(request);
+
+        // From the Wine side we'll send a zero byte struct back as an
+        // acknowledgement that audio processing has finished. At this point
+        // the audio will have been written to our buffers.
+        sockets_.host_plugin_process_replacing_.receive_single<Ack>();
+    }
 
     for (int channel = 0; channel < plugin_.numOutputs; channel++) {
         const T* output_channel =

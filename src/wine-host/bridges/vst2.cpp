@@ -237,6 +237,36 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     // Allow this plugin to configure the main context's tick rate
     main_context.update_timer_interval(config_.event_loop_interval());
 
+    // L2 — if the plugin-lib side created an AudioControlShm region for
+    // pi_cond audio transport, its name is in config_.audio_control_shm_name.
+    // Attach by that name. On any failure (stale region from a crashed
+    // predecessor, mmap failure, etc.) stay on socket transport.
+    //
+    // The plugin-lib side guarantees the shmem is fully constructed and
+    // its pi_mutex/pi_cond pairs are initialized BEFORE sending the
+    // Configuration. So by the time we receive Configuration here, the
+    // Attach is safe — no race.
+    if (config_.audio_control_shm_name) {
+        try {
+            audio_control_shm_.emplace(
+                yabridge::nspa::AudioControlShm::Attach{},
+                *config_.audio_control_shm_name);
+        } catch (const std::system_error& e) {
+            Logger logger = Logger::create_exception_logger();
+            logger.log(std::string("L2 pi_cond audio rendezvous attach "
+                                   "failed (name='") +
+                       *config_.audio_control_shm_name + "'): " + e.what() +
+                       " — falling back to socket transport.");
+        }
+    }
+
+    // Pre-size the local copy buffers used by the audio thread for
+    // pi_cond request reception + Ack serialization. .data() must be
+    // valid for the full inline capacity. quickSerialization on the
+    // reply path resizes pi_cond_reply_local_ within inline storage.
+    pi_cond_req_local_.resize(yabridge::nspa::audio_control_buf_size);
+    pi_cond_reply_local_.reserve(yabridge::nspa::audio_control_buf_size);
+
     parameters_handler_ = Win32Thread([&]() {
         yabridge::nspa::set_thread_time_critical();
         pthread_setname_np(pthread_self(), "parameters");
@@ -273,111 +303,222 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
         // they start producing denormals
         ScopedFlushToZero ftz_guard;
 
-        sockets_.host_plugin_process_replacing_.receive_multi<
-            Vst2ProcessRequest>([&](Vst2ProcessRequest& process_request,
-                                    SerializationBufferBase& buffer) {
-            // Since the value cannot change during this processing cycle,
-            // we'll send the current transport information as part of the
-            // request so we prefetch it to avoid unnecessary callbacks from
-            // the audio thread
-            std::optional<decltype(time_info_cache_)::Guard>
-                time_info_cache_guard =
-                    process_request.current_time_info
-                        ? std::optional(time_info_cache_.set(
-                              *process_request.current_time_info))
-                        : std::nullopt;
+        if (audio_control_shm_) [[likely]] {
+            // L2 — pi_cond+pi_mutex transport. Per-callback cross-process
+            // PI handoff: plugin-lib's signal applies its (the DAW audio
+            // thread's) effective priority to this thread via
+            // FUTEX_CMP_REQUEUE_PI. AudioControlShm v2 protocol releases
+            // the pi_mutex BEFORE invoking handle_process_replacing, so
+            // plugin processing runs with no cross-process lock held.
+            while (!audio_loop_stop_.load(std::memory_order_acquire)) {
+                try {
+                    yabridge::nspa::audio_control_recv_one(
+                        *audio_control_shm_,
+                        pi_cond_req_local_.data(),
+                        yabridge::nspa::audio_control_buf_size,
+                        pi_cond_reply_local_.data(),
+                        yabridge::nspa::audio_control_buf_size,
+                        [&](const uint8_t* req_bytes, size_t req_size,
+                            uint8_t* reply_out, size_t reply_capacity)
+                            -> size_t {
+                            // Deserialize request from local buffer (the
+                            // helper already copied the bytes from shmem
+                            // into pi_cond_req_local_; we pass that
+                            // pointer back as req_bytes).
+                            //
+                            // bitsery's InputAdapter<SerializationBufferBase>
+                            // wants an iterator into a SmallVectorImpl.
+                            // pi_cond_req_local_ IS a SmallVector;
+                            // req_bytes is its data pointer; use the
+                            // begin() iterator + req_size.
+                            Vst2ProcessRequest process_request;
+                            auto [_, ok] = bitsery::quickDeserialization<
+                                InputAdapter<SerializationBufferBase>>(
+                                {pi_cond_req_local_.begin(), req_size},
+                                process_request);
+                            if (!ok) [[unlikely]] {
+                                throw std::runtime_error(
+                                    "L2 request deserialization failed");
+                            }
 
-            // We'll also prefetch the process level, since some plugins
-            // will ask for this during every processing cycle
-            decltype(process_level_cache_)::Guard process_level_cache_guard =
-                process_level_cache_.set(process_request.current_process_level);
+                            // Run the same handler the socket path uses.
+                            // No cross-process lock held during this call.
+                            handle_process_replacing(process_request);
 
-            // Let the plugin process the MIDI events that were received
-            // since the last buffer, and then clean up those events. This
-            // approach should not be needed but Kontakt only stores
-            // pointers to rather than copies of the events.
-            std::lock_guard lock(next_buffer_midi_events_mutex_);
+                            // Serialize Ack reply into pi_cond_reply_local_.
+                            // quickSerialization resizes the SmallVector;
+                            // for Ack (zero-byte struct + bitsery overhead
+                            // = <100 B) this stays within inline storage,
+                            // no heap activity.
+                            const size_t reply_size = bitsery::quickSerialization<
+                                OutputAdapter<SerializationBufferBase>>(
+                                pi_cond_reply_local_, Ack{});
+                            if (reply_size > reply_capacity) [[unlikely]] {
+                                throw std::overflow_error(
+                                    "L2 reply too large for reply buffer");
+                            }
 
-            // As an optimization we no don't pass the input audio along
-            // with `Vst2ProcessRequest`, and instead we'll write it to a
-            // shared memory object on the plugin side. We can then write
-            // the output audio to the same shared memory object. Since the
-            // host should only be calling one of `process()`,
-            // processReplacing()` or `processDoubleReplacing()`, we can all
-            // handle them all at once. We pick which one to call depending
-            // on the type of data we got sent and the plugin's reported
-            // support for these functions.
-            auto do_process = [&]<typename T>(T) {
-                // These were set up after the host called
-                // `effMainsChanged()` with the correct size, so this
-                // reinterpret cast is safe even if the host suddenly starts
-                // sending 32-bit single precision audio after it set up
-                // audio processing for double precision (not that the
-                // Windows VST2 plugin would be able to handle that,
-                // presumably)
-                T** input_channel_pointers = reinterpret_cast<T**>(
-                    process_buffers_input_pointers_.data());
-                T** output_channel_pointers = reinterpret_cast<T**>(
-                    process_buffers_output_pointers_.data());
-
-                if constexpr (std::is_same_v<T, float>) {
-                    // Any plugin made in the last fifteen years or so
-                    // should support `processReplacing`. In the off chance
-                    // it does not we can just emulate this behavior
-                    // ourselves.
-                    if (plugin_->processReplacing) {
-                        plugin_->processReplacing(
-                            plugin_, input_channel_pointers,
-                            output_channel_pointers,
-                            process_request.sample_frames);
-                    } else {
-                        // If we zero out this buffer then the behavior is
-                        // the same as `processReplacing`
-                        for (int channel = 0; channel < plugin_->numOutputs;
-                             channel++) {
-                            std::fill(output_channel_pointers[channel],
-                                      output_channel_pointers[channel] +
-                                          process_request.sample_frames,
-                                      static_cast<T>(0.0));
-                        }
-
-                        plugin_->process(plugin_, input_channel_pointers,
-                                         output_channel_pointers,
-                                         process_request.sample_frames);
-                    }
-                } else if (std::is_same_v<T, double>) {
-                    plugin_->processDoubleReplacing(
-                        plugin_, input_channel_pointers,
-                        output_channel_pointers, process_request.sample_frames);
-                } else {
-                    static_assert(
-                        std::is_same_v<T, float> || std::is_same_v<T, double>,
-                        "Audio processing only works with single and "
-                        "double precision floating point numbers");
+                            // Defensive copy: if SmallVector somehow grew
+                            // beyond its inline 64 KiB (it shouldn't for
+                            // Ack), .data() moved to heap and reply_out
+                            // — captured at the outer audio_control_recv_one
+                            // call before bitsery wrote — points to the
+                            // stale inline location. Copy from the current
+                            // .data() to reply_out so the helper's
+                            // subsequent memcpy(layout.reply_buf, reply_out,
+                            // reply_size) reads valid bytes. In the
+                            // overwhelming common case (no grow), the
+                            // pointers match and the memcpy is a no-op.
+                            if (pi_cond_reply_local_.data() != reply_out) {
+                                std::memcpy(reply_out,
+                                            pi_cond_reply_local_.data(),
+                                            reply_size);
+                            }
+                            return reply_size;
+                        });
+                } catch (const yabridge::nspa::AudioControlShutdown&) {
+                    // Teardown signaled; exit cleanly.
+                    break;
                 }
-            };
-
-            assert(process_buffers_);
-            if (process_request.double_precision) {
-                // XXX: Clangd doesn't let you specify template parameters
-                //      for templated lambdas. This argument should get
-                //      optimized out
-                do_process(double());
-            } else {
-                do_process(float());
+                // Other exceptions propagate out of the thread — same
+                // behaviour as the socket loop's receive_multi on error.
             }
+        } else {
+            sockets_.host_plugin_process_replacing_.receive_multi<
+                Vst2ProcessRequest>(
+                [&](Vst2ProcessRequest& process_request,
+                    SerializationBufferBase& buffer) {
+                    handle_process_replacing(process_request);
 
-            // We modified the buffers within the `process_response` object,
-            // so we can just send that object back. Like on the plugin side
-            // we cannot reuse the request object because a plugin may have
-            // a different number of input and output channels
-            sockets_.host_plugin_process_replacing_.send(Ack{}, buffer);
-
-            // See the docstrong on `should_clear_midi_events` for why we
-            // don't just clear `next_buffer_midi_events` here
-            should_clear_midi_events_ = true;
-        });
+                    // Zero-byte Ack — like on the plugin side, we cannot
+                    // reuse the request object because a plugin may have
+                    // a different number of input and output channels
+                    sockets_.host_plugin_process_replacing_.send(Ack{}, buffer);
+                });
+        }
     });
+}
+
+// Extracted from the original process_replacing_handler_ inline lambda
+// so both the socket transport (receive_multi callback) and the pi_cond
+// transport (audio_control_recv_one handler) share this body.
+// Identical semantics — verbatim relocation.
+Ack Vst2Bridge::handle_process_replacing(Vst2ProcessRequest& process_request) {
+    // Since the value cannot change during this processing cycle, we'll
+    // send the current transport information as part of the request so we
+    // prefetch it to avoid unnecessary callbacks from the audio thread.
+    std::optional<decltype(time_info_cache_)::Guard> time_info_cache_guard =
+        process_request.current_time_info
+            ? std::optional(
+                  time_info_cache_.set(*process_request.current_time_info))
+            : std::nullopt;
+
+    // We'll also prefetch the process level, since some plugins will ask
+    // for this during every processing cycle.
+    decltype(process_level_cache_)::Guard process_level_cache_guard =
+        process_level_cache_.set(process_request.current_process_level);
+
+    // Let the plugin process the MIDI events that were received since the
+    // last buffer, and then clean up those events. This approach should
+    // not be needed but Kontakt only stores pointers to rather than copies
+    // of the events.
+    std::lock_guard lock(next_buffer_midi_events_mutex_);
+
+    // As an optimization we no don't pass the input audio along with
+    // `Vst2ProcessRequest`, and instead we'll write it to a shared memory
+    // object on the plugin side. We can then write the output audio to
+    // the same shared memory object. Since the host should only be calling
+    // one of `process()`, `processReplacing()` or `processDoubleReplacing()`,
+    // we can all handle them all at once. We pick which one to call
+    // depending on the type of data we got sent and the plugin's reported
+    // support for these functions.
+    auto do_process = [&]<typename T>(T) {
+        // These were set up after the host called `effMainsChanged()` with
+        // the correct size, so this reinterpret cast is safe even if the
+        // host suddenly starts sending 32-bit single precision audio after
+        // it set up audio processing for double precision (not that the
+        // Windows VST2 plugin would be able to handle that, presumably).
+        T** input_channel_pointers =
+            reinterpret_cast<T**>(process_buffers_input_pointers_.data());
+        T** output_channel_pointers =
+            reinterpret_cast<T**>(process_buffers_output_pointers_.data());
+
+        if constexpr (std::is_same_v<T, float>) {
+            // Any plugin made in the last fifteen years or so should support
+            // `processReplacing`. In the off chance it does not we can just
+            // emulate this behavior ourselves.
+            if (plugin_->processReplacing) {
+                plugin_->processReplacing(plugin_, input_channel_pointers,
+                                          output_channel_pointers,
+                                          process_request.sample_frames);
+            } else {
+                // If we zero out this buffer then the behavior is the same
+                // as `processReplacing`
+                for (int channel = 0; channel < plugin_->numOutputs;
+                     channel++) {
+                    std::fill(output_channel_pointers[channel],
+                              output_channel_pointers[channel] +
+                                  process_request.sample_frames,
+                              static_cast<T>(0.0));
+                }
+
+                plugin_->process(plugin_, input_channel_pointers,
+                                 output_channel_pointers,
+                                 process_request.sample_frames);
+            }
+        } else if (std::is_same_v<T, double>) {
+            plugin_->processDoubleReplacing(plugin_, input_channel_pointers,
+                                            output_channel_pointers,
+                                            process_request.sample_frames);
+        } else {
+            static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
+                          "Audio processing only works with single and "
+                          "double precision floating point numbers");
+        }
+    };
+
+    assert(process_buffers_);
+    if (process_request.double_precision) {
+        // XXX: Clangd doesn't let you specify template parameters for
+        //      templated lambdas. This argument should get optimized out.
+        do_process(double());
+    } else {
+        do_process(float());
+    }
+
+    // See the docstrong on `should_clear_midi_events` for why we don't
+    // just clear `next_buffer_midi_events` here.
+    should_clear_midi_events_ = true;
+
+    return Ack{};
+}
+
+Vst2Bridge::~Vst2Bridge() noexcept {
+    // L2 — wake the pi_cond audio thread BEFORE implicit member destruction.
+    // Member declaration order in vst2.h is:
+    //   audio_control_shm_   (declared early → destructs LATE)
+    //   ...
+    //   parameters_handler_  Win32Thread
+    //   process_replacing_handler_  Win32Thread
+    //   sockets_             (declared last → destructs FIRST)
+    //
+    // Reverse destruction:
+    //   1. sockets_ destructs (sockets close → parameters_handler_'s
+    //      receive_multi returns; main thread's receive_events in
+    //      Vst2Bridge::run() returns — though run() already returned
+    //      before destructor runs).
+    //   2. process_replacing_handler_ joins. The audio thread is parked
+    //      in pi_cond_wait inside audio_control_recv_one. We need the
+    //      shutdown signal to reach it BEFORE this point — which we
+    //      send right here.
+    //   3. parameters_handler_ joins (was already exiting via socket close).
+    //   4. ... other members ...
+    //   5. audio_control_shm_ destructs (unmaps shmem). By here all
+    //      threads have joined, so safe.
+    if (audio_control_shm_) {
+        audio_loop_stop_.store(true, std::memory_order_release);
+        audio_control_shm_->signal_shutdown();
+    }
 }
 
 #pragma GCC diagnostic pop
