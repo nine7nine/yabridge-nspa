@@ -376,6 +376,15 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
                     e.what());
             }
             if (!ok_dispatch) {
+                // Socket fallback path — restore process_context_ that
+                // the L2 path cleared so the bitsery serialization on
+                // the socket side includes correct transport info.
+                // Mirrors the request-size-overflow branch above and the
+                // VST2/CLAP equivalents.
+                if (envelope_publishes_context) {
+                    process_request_.data.process_context_ =
+                        std::move(ctx_for_fallback);
+                }
                 bridge_.receive_audio_processor_message_into(
                     MessageReference<YaAudioProcessor::Process>(
                         process_request_),
