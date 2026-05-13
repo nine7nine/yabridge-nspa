@@ -99,6 +99,16 @@ inline void set_thread_normal() noexcept {
 // caller to TIME_CRITICAL before the plugin call, we ensure spawned
 // workers come up at the NSPA-mapped audio band, not at the caller's
 // regular priority.
+//
+// Also used to bracket LoadLibrary itself (see load_library_rt below).
+// The plugin's DllMain runs synchronously inside LoadLibrary, and some
+// plugins (notably u-he's VST3s — Zebra2, ACE, etc.) spawn
+// boost::thread workers during PROCESS_ATTACH static init. If the
+// caller is at default priority and the plugin's pthread_create asks
+// for SCHED_FIFO, the kernel rejects the request (the parent has no
+// RT entitlement to grant), boost::thread throws
+// thread_resource_error, and the plugin dies before reaching the
+// plugin's normal entry point.
 class ScopedTimeCriticalBoost {
    public:
     ScopedTimeCriticalBoost() noexcept
@@ -118,5 +128,26 @@ class ScopedTimeCriticalBoost {
    private:
     int saved_priority_;
 };
+
+// LoadLibrary wrapped in a ScopedTimeCriticalBoost so plugins which
+// spawn boost::thread / std::thread workers during DllMain
+// PROCESS_ATTACH or static-initializer code (u-he VST3s among others)
+// see an RT-capable parent thread and the kernel grants their
+// pthread_create RT requests. Used as the member-initializer
+// expression for the plugin handle on each bridge.
+//
+// Returning the result from a body block via a lambda is the only way
+// to keep this an in-line expression while still scoping the boost
+// guard to the LoadLibrary call alone — we don't want the wrapping
+// bridge's other member inits running at TIME_CRITICAL.
+inline HMODULE load_library_rt(const char* path) noexcept {
+    ScopedTimeCriticalBoost boost;
+    // Explicit `LoadLibraryA` rather than the `LoadLibrary` macro: the
+    // macro resolves to `LoadLibraryW` under UNICODE builds and the
+    // bridge call sites pass a `const char*` (the converted DOS path
+    // from `to_dos_path`), so the explicit ANSI form keeps the signature
+    // stable across UNICODE configurations.
+    return LoadLibraryA(path);
+}
 
 }  // namespace yabridge::nspa

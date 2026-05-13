@@ -21,6 +21,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -34,6 +35,28 @@
 
 // Forward declaration for use in our watchdog in `MainContext`
 class HostBridge;
+
+/**
+ * Convert a Linux filesystem path to a Wine DOS path (e.g. `C:\\...`) via
+ * Wine's dosdevices mapping. Returns the converted UTF-8 path on success,
+ * or `unix_path` verbatim if no DOS equivalent exists.
+ *
+ * Used before `LoadLibrary()` (and the equivalent VST3/CLAP module-load
+ * entry points) so Win32 plugins that introspect their own location via
+ * `GetModuleFileNameW()` see a normal `C:\\...` path. Without this, Wine
+ * stores the raw NT-namespace `unix\\<host-path>` as the module's
+ * `FullDllName` (upstream Wine `dlls/ntdll/loader.c` strips only `\\??\\`
+ * and stores the remainder verbatim), which plugins such as u-he's VST3s
+ * cannot parse and then fail with a "Could not find binary path" C++
+ * throw.
+ *
+ * Implementation calls `wine_get_dos_file_name()` first, but that helper
+ * empirically only canonicalizes paths whose file extension is one of
+ * `.dll`, `.exe`, `.sys`, `.drv` — for `.vst3` / `.clap` it returns the
+ * raw `\\?\\unix\\<host-path>` form. We detect that and fall back to a
+ * manual `$WINEPREFIX/dosdevices/` longest-prefix-match walk.
+ */
+std::string to_dos_path(const std::string& unix_path) noexcept;
 
 /**
  * A proxy function that calls `Win32Thread::entry_point` since `CreateThread()`

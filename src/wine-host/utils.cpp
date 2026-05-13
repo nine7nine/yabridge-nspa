@@ -31,11 +31,100 @@
 #define SYS_pidfd_open 434  // x86_64
 #endif
 
+#include <algorithm>
+#include <cctype>
+#include <codecvt>
 #include <iostream>
+#include <locale>
+#include <optional>
+#include <system_error>
 
 #include "bridges/common.h"
 
 using namespace std::literals::chrono_literals;
+
+namespace {
+
+// Empirically `wine_get_dos_file_name()` only canonicalizes a file's path
+// to its drive-rooted DOS form for a small set of recognized image
+// extensions (`.dll`, `.exe`, `.sys`, `.drv`). For every other extension
+// (including the ones we care about: `.vst3`, `.clap`, plus the generic
+// VST2 `.dll` case that does work) Wine returns a raw NT-namespace path
+// like `\\?\unix\home\...` even when the file lives under a registered
+// drive. We treat that as a non-result and fall through to a manual
+// dosdevices walk.
+std::optional<std::string> wine_convert_to_dos(const std::string& unix_path) {
+    WCHAR* converted = wine_get_dos_file_name(unix_path.c_str());
+    if (!converted) return std::nullopt;
+
+    static_assert(sizeof(WCHAR) == sizeof(char16_t));
+    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
+    std::string result = converter.to_bytes(
+        std::u16string(reinterpret_cast<char16_t*>(converted)));
+    HeapFree(GetProcessHeap(), 0, converted);
+
+    if (result.compare(0, 8, "\\\\?\\unix") == 0) return std::nullopt;
+    return result;
+}
+
+// Walk `$WINEPREFIX/dosdevices/` and find the drive whose symlink target
+// is the longest unix prefix of `unix_path`. Returns the DOS path on a
+// successful match, std::nullopt otherwise. This mirrors what Wine itself
+// would do if it routed all extensions through its drive-letter mapping.
+std::optional<std::string> manual_dosdevices_lookup(
+    const std::string& unix_path) {
+    const char* prefix_env = std::getenv("WINEPREFIX");
+    if (!prefix_env) return std::nullopt;
+
+    namespace fs = ghc::filesystem;
+    std::error_code ec;
+    fs::path dosdevices = fs::path(prefix_env) / "dosdevices";
+    if (!fs::is_directory(dosdevices, ec)) return std::nullopt;
+
+    std::string best_letter;
+    size_t best_match_len = 0;
+
+    for (auto it = fs::directory_iterator(dosdevices, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        // Drive letter entries are exactly `X:` — skip `X::` block-device
+        // aliases (those point at /dev/* nodes, not directories that
+        // would plausibly contain a plugin).
+        if (name.length() != 2 || name[1] != ':' ||
+            !std::isalpha(static_cast<unsigned char>(name[0]))) {
+            continue;
+        }
+
+        std::error_code resolve_ec;
+        fs::path target = fs::canonical(it->path(), resolve_ec);
+        if (resolve_ec) continue;
+        std::string target_str = target.string();
+        if (!target_str.empty() && target_str.back() != '/') target_str += '/';
+
+        if (unix_path.length() >= target_str.length() &&
+            unix_path.compare(0, target_str.length(), target_str) == 0 &&
+            target_str.length() > best_match_len) {
+            best_letter = std::string(
+                1, static_cast<char>(
+                       std::toupper(static_cast<unsigned char>(name[0]))));
+            best_match_len = target_str.length();
+        }
+    }
+
+    if (best_match_len == 0) return std::nullopt;
+
+    std::string dos = best_letter + ":\\" + unix_path.substr(best_match_len);
+    std::replace(dos.begin(), dos.end(), '/', '\\');
+    return dos;
+}
+
+}  // namespace
+
+std::string to_dos_path(const std::string& unix_path) noexcept {
+    if (auto r = wine_convert_to_dos(unix_path)) return *r;
+    if (auto r = manual_dosdevices_lookup(unix_path)) return *r;
+    return unix_path;
+}
 
 uint32_t WINAPI
 win32_thread_trampoline(fu2::unique_function<void()>* entry_point) {

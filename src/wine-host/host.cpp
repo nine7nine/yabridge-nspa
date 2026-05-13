@@ -94,6 +94,18 @@ int YABRIDGE_EXPORT
     //       https://github.com/robbert-vdh/yabridge/issues/368
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 
+    // NSPA: set REALTIME_PRIORITY_CLASS at process scope. NSPA caches the
+    // process class (ntdll/unix/process.c `nspa_rt_set_cached_priocls`) and
+    // resolves per-thread base priorities against it via
+    // `nspa_resolve_nt_band()` — without this, per-thread
+    // SetThreadPriority(TIME_CRITICAL) calls resolve to a middle SCHED_FIFO
+    // band instead of NSPA's high audio band. Also lets the kernel grant
+    // pthread_create for RT worker threads plugins spawn (e.g. u-he's
+    // boost::thread workers throw `boost::thread_resource_error` from a
+    // non-RT parent process when their internal pthread_create requests
+    // SCHED_FIFO).
+    SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+
     // NOTE: Some plugins use Microsoft COM, but don't initialize it first and
     //       just pray the host does it for them. Examples of this are
     //       PSPaudioware's InfiniStrip and Shattered Glass Audio Code Red Free.
