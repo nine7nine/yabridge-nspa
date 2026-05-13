@@ -978,12 +978,26 @@ void Vst3Bridge::run() {
                         const auto& [instance, _] =
                             get_instance(request.owner_instance_id);
 
-                        // Cleanup is handled through RAII
-                        const tresult result =
-                            instance.plug_view_instance->plug_view->removed();
-                        instance.editor.reset();
-
-                        return result;
+                        // NOTE: We deliberately do NOT reset the editor here,
+                        //   even though the comment used to say "cleanup is
+                        //   handled through RAII".  The host typically follows
+                        //   removed() with setFrame(NULL) (per Steinberg's
+                        //   close-handshake), and some plugins (u-he ACE,
+                        //   Zebra2 — VST3) traverse their internal window
+                        //   state on setFrame(NULL).  Tearing down the editor
+                        //   wrapper synchronously here reparents the wine
+                        //   window out + destroys the X11 wrapper before
+                        //   setFrame(NULL) arrives, and those plugins fault
+                        //   inside Wine PE-side code accessing the now-stale
+                        //   state.  Steinberg's IPlugView::removed() spec
+                        //   means "no longer attached", not "destroy the host-
+                        //   side wrapper".  The Attached handler always
+                        //   .emplace()s a fresh editor when reopening, so the
+                        //   old one is replaced on demand, and if the host
+                        //   releases the IPlugView without reopening the
+                        //   editor is freed when Vst3PluginInstance dies.
+                        return instance.plug_view_instance->plug_view
+                            ->removed();
                     })
                     .get();
             },
