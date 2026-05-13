@@ -23,6 +23,7 @@
 // Generated inside of the build directory
 #include <version.h>
 
+#include "../../common/serialization/clap-direct-envelope.h"
 #include "../nspa_rt.h"
 
 namespace fs = ghc::filesystem;
@@ -1280,6 +1281,32 @@ void ClapBridge::register_plugin_instance(
                                     throw std::runtime_error(
                                         "L2 CLAP Process deserialization "
                                         "failed");
+                                }
+
+                                // === NSPA L2 direct-struct envelope
+                                //     override (P2: clap_event_transport_t) ===
+                                //
+                                // When envelope_active() and the
+                                // envelope flag is set, rehydrate
+                                // process_request_.process.transport_
+                                // from the shmem envelope.  The
+                                // producer cleared it from the bitsery
+                                // payload to shrink the wire format.
+                                if (inst->audio_control_shm
+                                        ->envelope_active()) {
+                                    const auto& env =
+                                        inst->audio_control_shm->layout()
+                                            .request_envelope_clap;
+                                    if (env.flags &
+                                        yabridge::nspa::
+                                            clap_envelope_flag_transport_valid) {
+                                        clap_event_transport_t tp{};
+                                        yabridge::nspa::
+                                            clap_transport_from_direct(
+                                                env.transport, tp);
+                                        inst->pi_cond_process_request.process
+                                            .transport_ = tp;
+                                    }
                                 }
 
                                 // Same body as the socket Process lambda

@@ -154,6 +154,8 @@ AudioControlShm::AudioControlShm(Create, const std::string& name)
                 sizeof(layout_->request_envelope_vst3));
     std::memset(&layout_->request_envelope_vst2, 0,
                 sizeof(layout_->request_envelope_vst2));
+    std::memset(&layout_->request_envelope_clap, 0,
+                sizeof(layout_->request_envelope_clap));
 }
 
 AudioControlShm::AudioControlShm(Attach, const std::string& name)

@@ -177,9 +177,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // Version 1 = bitsery payload only (Commit 1 scaffold; no direct-struct
 //             extension active).
 // Version 2 = VST3 request envelope with ProcessContext direct.
-// Version 3 = adds VST2 request envelope with VstTimeInfo direct
-//             (this commit).  CLAP envelope added next, bumping again.
-constexpr uint32_t audio_control_layout_version = 3;
+// Version 3 = VST2 request envelope with VstTimeInfo direct.
+// Version 4 = CLAP request envelope with clap_event_transport_t direct
+//             (this commit).
+constexpr uint32_t audio_control_layout_version = 4;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -291,6 +292,67 @@ static_assert(alignof(Vst2ProcessEnvelope) == 64,
 static_assert(offsetof(Vst2ProcessEnvelope, time_info) == 64,
               "time_info must start at offset 64 (own cacheline)");
 
+// Direct-struct mirror of `clap_event_header_t`.  16-byte POD,
+// 4-byte alignment.  Field-for-field match with the CLAP SDK header.
+struct ClapEventHeaderDirect {
+    uint32_t size;
+    uint32_t time;
+    uint16_t space_id;
+    uint16_t type;
+    uint32_t flags;
+};
+static_assert(sizeof(ClapEventHeaderDirect) == 16,
+              "ClapEventHeaderDirect ABI: 16-byte layout sanity check");
+static_assert(alignof(ClapEventHeaderDirect) == 4,
+              "ClapEventHeaderDirect ABI: 4-byte natural alignment");
+
+// Direct-struct mirror of `clap_event_transport_t`.  All-POD wire
+// format with explicit padding to keep 8-byte int64/double natural
+// alignment.  112 bytes total.  Conversion helpers in
+// `common/serialization/clap-direct-envelope.h`.
+struct ClapTransportDirect {
+    ClapEventHeaderDirect header;       // 0   (16 bytes)
+    uint32_t flags;                     // 16  clap_transport_flags
+    uint32_t _pad0;                     // 20  align next int64 to 24
+    int64_t  song_pos_beats;            // 24
+    int64_t  song_pos_seconds;          // 32
+    double   tempo;                     // 40
+    double   tempo_inc;                 // 48
+    int64_t  loop_start_beats;          // 56
+    int64_t  loop_end_beats;            // 64
+    int64_t  loop_start_seconds;        // 72
+    int64_t  loop_end_seconds;          // 80
+    int64_t  bar_start;                 // 88
+    int32_t  bar_number;                // 96
+    uint16_t tsig_num;                  // 100
+    uint16_t tsig_denom;                // 102
+    uint32_t _trail_pad;                // 104  align size to multiple of 8
+};
+static_assert(sizeof(ClapTransportDirect) == 112,
+              "ClapTransportDirect ABI: 112-byte layout sanity check");
+static_assert(alignof(ClapTransportDirect) == 8,
+              "ClapTransportDirect ABI: 8-byte natural alignment");
+
+// CLAP request-direction envelope.  Carries the fixed-shape per-block
+// transport field.  P2 (this commit) covers clap_event_transport_t
+// only — variable-size event stream (mixed param changes + MIDI) is
+// deferred to a later phase pending measurement.
+struct alignas(64) ClapProcessEnvelope {
+    // Header — first cacheline.  bit 0: transport_valid.
+    uint32_t flags;
+    uint32_t _hdr_pad[15];
+
+    // Transport payload — starts at offset 64 (next cacheline).
+    ClapTransportDirect transport;       // 112 bytes
+    // trailing pad to next 64-byte boundary handled by struct alignas
+};
+static_assert(sizeof(ClapProcessEnvelope) % 64 == 0,
+              "ClapProcessEnvelope must be a multiple of cacheline size");
+static_assert(alignof(ClapProcessEnvelope) == 64,
+              "ClapProcessEnvelope cacheline-aligned");
+static_assert(offsetof(ClapProcessEnvelope, transport) == 64,
+              "transport must start at offset 64 (own cacheline)");
+
 // Environment variable that opts INTO the direct-struct envelope path.
 // Default off — incremental rollout gate. Will be flipped to default-on
 // opt-out after measurement validates the gain on representative
@@ -358,6 +420,7 @@ struct AudioControlShmLayout {
     // instance's plugin format is populated; others stay zeroed.
     alignas(64) Vst3ProcessEnvelope request_envelope_vst3;
     alignas(64) Vst2ProcessEnvelope request_envelope_vst2;
+    alignas(64) ClapProcessEnvelope request_envelope_clap;
 };
 
 static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
@@ -365,8 +428,9 @@ static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
 static_assert(sizeof(AudioControlShmLayout) >=
                   (2 * audio_control_buf_size + 320 + 64 +
                    sizeof(Vst3ProcessEnvelope) +
-                   sizeof(Vst2ProcessEnvelope)),
-              "layout sanity check (with VST3 + VST2 envelope extensions)");
+                   sizeof(Vst2ProcessEnvelope) +
+                   sizeof(ClapProcessEnvelope)),
+              "layout sanity check (with all three envelope extensions)");
 
 // RAII handle to an AudioControlShm region. Holds the shm_open fd and
 // the mmap pointer. Constructor mode controls whether we create

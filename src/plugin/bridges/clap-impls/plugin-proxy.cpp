@@ -16,6 +16,7 @@
 
 #include "plugin-proxy.h"
 
+#include "../../../common/serialization/clap-direct-envelope.h"
 #include "../clap.h"
 
 ClapHostExtensions::ClapHostExtensions(const clap_host& host) noexcept
@@ -332,6 +333,35 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
         // shape as the VST3 proxy. Process metadata is bounded at
         // audio_control_buf_size; the audio buffers themselves live in
         // process_buffers_ (AudioShmBuffer).
+        //
+        // === NSPA L2 direct-struct envelope write (P2: clap_event_transport_t) ===
+        //
+        // When envelope_active(), publish clap_event_transport_t
+        // directly into the shmem envelope and clear
+        // process_request_.process.transport_ so bitsery encodes a
+        // 1-byte "absent" optional tag instead of the full ~112-byte
+        // serialized struct.  Save into transport_for_fallback for
+        // the rare over-budget socket path which doesn't read the
+        // envelope and needs transport carried via bitsery.
+        std::optional<clap_event_transport_t> transport_for_fallback;
+        const bool envelope_publishes_transport =
+            self->audio_control_shm_->envelope_active() &&
+            self->process_request_.process.transport_.has_value();
+        if (envelope_publishes_transport) {
+            auto& env = self->audio_control_shm_->layout()
+                            .request_envelope_clap;
+            yabridge::nspa::clap_transport_to_direct(
+                *self->process_request_.process.transport_, env.transport);
+            env.flags =
+                yabridge::nspa::clap_envelope_flag_transport_valid;
+            transport_for_fallback =
+                std::move(self->process_request_.process.transport_);
+            self->process_request_.process.transport_.reset();
+        } else if (self->audio_control_shm_->envelope_active()) {
+            self->audio_control_shm_->layout()
+                .request_envelope_clap.flags = 0;
+        }
+
         const size_t request_size =
             bitsery::quickSerialization<OutputAdapter<SerializationBufferBase>>(
                 self->pi_cond_req_buf_, self->process_request_);
@@ -363,6 +393,13 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
             }
         }
         if (!ok_dispatch) {
+            // Restore transport_ before socket fallback — the L2 envelope
+            // path cleared it from process_request_ to shrink the bitsery
+            // payload, but the socket transport doesn't read the envelope.
+            if (envelope_publishes_transport) {
+                self->process_request_.process.transport_ =
+                    std::move(transport_for_fallback);
+            }
             self->bridge_.receive_audio_thread_message_into(
                 MessageReference<clap::plugin::Process>(self->process_request_),
                 self->process_response_);
