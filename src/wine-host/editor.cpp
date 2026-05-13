@@ -1042,12 +1042,41 @@ bool Editor::is_wine_window_active() const {
 }
 
 void Editor::redetect_host_window() noexcept {
-    const xcb_window_t new_host_window =
-        find_host_window(*x11_connection_, parent_window_,
-                         xcb_wm_window_role_property_)
-            .value_or(find_host_window_from_query_tree(*x11_connection_,
-                                                       parent_window_)
-                          .value_or(parent_window_));
+    // find_host_window and find_host_window_from_query_tree call
+    // find_ancestor_windows, which queries the X11 tree and throws
+    // std::runtime_error via THROW_X11_ERROR on any xcb error reply
+    // (typically BadWindow when a window has been destroyed mid-flight).
+    // This function is declared noexcept, so any exception escaping
+    // here invokes std::terminate.  Under Wine that triggers a libc++
+    // DWARF eh_frame unwind whose personality routine Wine's PE-side
+    // virtual_unwind can't dispatch — the unwinder reports
+    //   fixme:seh:virtual_unwind calling personality routine in system
+    //   library not supported yet
+    // for every frame and never progresses, exhausting the 1 MB worker
+    // thread stack and wedging the host process.  Carla then waits
+    // forever for the worker to exit, manifesting as an editor-close
+    // hang.
+    //
+    // Catch the runtime_error here and log; we'll keep the existing
+    // host_window_ for this round.  The function still does what it
+    // can with the information it has — worst case, focus / event-mask
+    // routing on the old host window stays correct, which is what we
+    // want during teardown anyway.
+    xcb_window_t new_host_window;
+    try {
+        new_host_window =
+            find_host_window(*x11_connection_, parent_window_,
+                             xcb_wm_window_role_property_)
+                .value_or(find_host_window_from_query_tree(*x11_connection_,
+                                                           parent_window_)
+                              .value_or(parent_window_));
+    } catch (const std::runtime_error& error) {
+        std::cerr << "redetect_host_window: X11 error during ancestor "
+                     "walk (likely a window destroyed mid-flight), "
+                     "keeping previous host_window_: "
+                  << error.what() << std::endl;
+        return;
+    }
 
     if (new_host_window == host_window_) {
         return;
