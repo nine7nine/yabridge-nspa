@@ -178,9 +178,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 //             extension active).
 // Version 2 = VST3 request envelope with ProcessContext direct.
 // Version 3 = VST2 request envelope with VstTimeInfo direct.
-// Version 4 = CLAP request envelope with clap_event_transport_t direct
+// Version 4 = CLAP request envelope with clap_event_transport_t direct.
+// Version 5 = VST3 request envelope grown with fixed-shape event ring
 //             (this commit).
-constexpr uint32_t audio_control_layout_version = 4;
+constexpr uint32_t audio_control_layout_version = 5;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -220,23 +221,109 @@ static_assert(sizeof(ProcessContextDirect) == 112,
 static_assert(alignof(ProcessContextDirect) == 8,
               "ProcessContextDirect ABI: 8-byte natural alignment");
 
+// Direct-struct mirror of Steinberg::Vst::Event for the fixed-shape
+// variants (NoteOn/NoteOff/PolyPressure/NoteExpressionValue/
+// LegacyMIDICCOut).  Variable-payload variants (DataEvent,
+// NoteExpressionTextEvent, ChordEvent, ScaleEvent) stay on the bitsery
+// path — if a block contains ANY variable variant, the entire input
+// event list is kept in bitsery and the envelope event flag is not
+// set.  Block-level fallback, no per-event mixing.
+//
+// 48 bytes, 16-byte aligned.  Header is shared across variants; the
+// 24-byte payload union is sized to the largest fixed variant
+// (NoteOnEvent: 24 bytes).  Explicit-width primitives + manual padding
+// keep the layout ABI-stable across producer (Linux native gcc) and
+// consumer (winegcc PE side).  Conversion helpers in
+// `common/serialization/vst3/direct-envelope.h`.
+struct alignas(16) ProcessEventDirect {
+    int32_t  bus_index;          // 0
+    int32_t  sample_offset;      // 4
+    double   ppq_position;       // 8    Vst::TQuarterNotes (double)
+    uint16_t flags;              // 16   Steinberg::Vst::Event::EventFlags
+    uint16_t event_kind;         // 18   Steinberg::Vst::Event::EventTypes
+    uint32_t _pad0;              // 20   align payload to 24
+    union {
+        // NoteOnEvent — 24 bytes
+        struct {
+            int16_t  channel;        // 0
+            int16_t  pitch;          // 2
+            float    tuning;         // 4
+            float    velocity;       // 8
+            int32_t  length;         // 12
+            int32_t  note_id;        // 16
+            uint32_t _tail_pad;      // 20
+        } note_on;
+        // NoteOffEvent — 24 bytes
+        struct {
+            int16_t  channel;        // 0
+            int16_t  pitch;          // 2
+            float    velocity;       // 4
+            int32_t  note_id;        // 8
+            float    tuning;         // 12
+            uint64_t _tail_pad;      // 16
+        } note_off;
+        // PolyPressureEvent — 24 bytes
+        struct {
+            int16_t  channel;        // 0
+            int16_t  pitch;          // 2
+            float    pressure;       // 4
+            int32_t  note_id;        // 8
+            uint8_t  _tail_pad[12];  // 12
+        } poly_pressure;
+        // NoteExpressionValueEvent — 24 bytes
+        struct {
+            int32_t  type_id;        // 0
+            int32_t  note_id;        // 4
+            double   value;          // 8
+            uint64_t _tail_pad;      // 16
+        } note_expression_value;
+        // LegacyMIDICCOutEvent — 24 bytes
+        struct {
+            uint8_t  control_number; // 0
+            int8_t   channel;        // 1
+            int8_t   value;          // 2
+            int8_t   value2;         // 3
+            uint8_t  _tail_pad[20];  // 4
+        } legacy_midi_cc_out;
+        uint8_t raw[24];
+    } payload;                   // 24 bytes — starts at offset 24
+};
+static_assert(sizeof(ProcessEventDirect) == 48,
+              "ProcessEventDirect ABI: 48-byte layout sanity check");
+static_assert(alignof(ProcessEventDirect) == 16,
+              "ProcessEventDirect ABI: 16-byte natural alignment");
+static_assert(offsetof(ProcessEventDirect, payload) == 24,
+              "ProcessEventDirect payload at offset 24");
+
+// Maximum number of fixed-shape events the envelope can carry in one
+// block.  Sized for typical MIDI / note-expression density (32-64
+// events is heavy in practice); 256 leaves room for synthesizer test
+// stress patterns without forcing the bitsery path.
+constexpr size_t max_events_per_envelope = 256;
+
 // VST3 request-direction envelope.  Carries fixed-shape per-block fields
 // that the direct-struct path replaces bitsery for.  Extends per phase:
-//   P2 (this commit) — ProcessContext only.
-//   P3 (future) — fixed-shape event ring.
+//   P2 — ProcessContext.
+//   P3 (this commit) — fixed-shape event ring.
 //   P4 (future) — parameter queue array.
 //
-// Layout: cacheline-aligned header (flags), then cacheline-aligned
-// payload(s).  All access happens under the L2 request pi_mutex, so
-// no atomic primitives are needed on internal fields.
+// Layout: cacheline-aligned header (flags + event_count), then
+// cacheline-aligned payload(s).  All access happens under the L2
+// request pi_mutex, so no atomic primitives are needed on internal
+// fields.
 struct alignas(64) Vst3ProcessEnvelope {
-    // Header — first cacheline.  bit 0: process_context_valid.
+    // Header — first cacheline.
+    //   bit 0: process_context_valid
+    //   bit 1: input_events_valid (event_count entries from events[])
     uint32_t flags;
-    uint32_t _hdr_pad[15];                   // remainder of cacheline (60B)
+    uint32_t event_count;                    // P3: count of valid events
+    uint32_t _hdr_pad[14];                   // remainder of cacheline (56B)
 
-    // ProcessContext payload — starts at offset 64 (next cacheline).
-    ProcessContextDirect process_context;    // 112 bytes
-    // trailing pad to next 64-byte boundary handled by struct alignas
+    // ProcessContext payload — own cacheline (offset 64).
+    ProcessContextDirect process_context;    // 112 bytes (64..175)
+
+    // Event ring — cacheline-aligned (compiler inserts pad 176..191).
+    alignas(64) ProcessEventDirect events[max_events_per_envelope];
 };
 static_assert(sizeof(Vst3ProcessEnvelope) % 64 == 0,
               "Vst3ProcessEnvelope must be a multiple of cacheline size");
@@ -244,6 +331,10 @@ static_assert(alignof(Vst3ProcessEnvelope) == 64,
               "Vst3ProcessEnvelope cacheline-aligned");
 static_assert(offsetof(Vst3ProcessEnvelope, process_context) == 64,
               "process_context must start at offset 64 (own cacheline)");
+static_assert(offsetof(Vst3ProcessEnvelope, events) % 64 == 0,
+              "events array must start cacheline-aligned");
+static_assert(offsetof(Vst3ProcessEnvelope, events) == 192,
+              "events array at offset 192 (cacheline after process_context)");
 
 // Direct-struct representation of VST2's `VstTimeInfo` (vestige
 // `aeffectx.h` class).  Field-for-field mirror with explicit-width

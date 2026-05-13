@@ -278,23 +278,32 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
         // separate process_buffers_ AudioShmBuffer — only metadata
         // (parameter changes, MIDI events, transport, channel pointers)
         // flows through pi_cond_req_buf_.
-        // === NSPA L2 direct-struct envelope write (P2: ProcessContext) ===
+        // === NSPA L2 direct-struct envelope write ===
         //
         // When envelope_active() is true (creator opted in via
         // YABRIDGE_DIRECT_ENVELOPE=1 AND version match observed at peer
-        // attach), publish the fixed-shape ProcessContext fields directly
-        // into the shmem envelope, then clear process_context_ from the
-        // bitsery-bound process_request_ so the subsequent
-        // quickSerialization encodes only the 1-byte "absent" optional
-        // tag instead of the full ~100-byte serialized struct.  Consumer
-        // sees the absent optional after bitsery decode and rehydrates
-        // process_context_ from the envelope.
+        // attach), publish fixed-shape per-block fields directly into
+        // the shmem envelope, then clear / extract those fields from
+        // the bitsery-bound process_request_ so the subsequent
+        // quickSerialization encodes only minimal tags rather than the
+        // full serialized payload.  Consumer sees the empty/extracted
+        // values after bitsery decode and rehydrates from the envelope.
         //
-        // Save the cleared value into `ctx_for_fallback` so that if
-        // bitsery size exceeds the 64 KiB region budget (the rare
-        // over-budget path) we can restore process_context_ and use the
-        // socket transport — which doesn't read the envelope and
-        // therefore needs process_context_ in its bitsery payload.
+        // Phases:
+        //   P2 — ProcessContext (cleared via reset; restored via move).
+        //   P3 — input_events_ (events vector swapped out, leaving the
+        //        std::optional engaged-but-empty so bitsery encodes
+        //        "present, count=0").  Block-level fallback: if ANY
+        //        event in the block is a variable-payload variant
+        //        (DataEvent / NoteExpressionText / Chord / Scale) or
+        //        the count exceeds max_events_per_envelope, the entire
+        //        list stays on the bitsery path for that block.
+        //
+        // Saves into *_for_fallback so the socket fallback paths (rare
+        // bitsery-size overflow AND rare L2 mid-call transport error)
+        // can restore the original state before re-dispatching via the
+        // socket transport — which doesn't read the envelope and so
+        // needs the cleared fields in its bitsery payload.
         //
         // Writes happen-before audio_control_send_and_wait's
         // release-store of state inside the request pi_mutex.  The
@@ -302,24 +311,54 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
         // RequestReady synchronizes-with the producer's release-store,
         // making these envelope writes visible.  No explicit fence.
         std::optional<Steinberg::Vst::ProcessContext> ctx_for_fallback;
-        const bool envelope_publishes_context =
-            audio_control_shm_->envelope_active() &&
-            process_request_.data.process_context_.has_value();
-        if (envelope_publishes_context) {
+        llvm::SmallVector<YaEvent, 64> events_for_fallback;
+        bool envelope_publishes_context = false;
+        bool envelope_publishes_events  = false;
+        if (audio_control_shm_->envelope_active()) {
             auto& env = audio_control_shm_->layout().request_envelope_vst3;
-            yabridge::nspa::process_context_to_direct(
-                *process_request_.data.process_context_,
-                env.process_context);
-            env.flags =
-                yabridge::nspa::vst3_envelope_flag_process_context_valid;
-            ctx_for_fallback =
-                std::move(process_request_.data.process_context_);
-            process_request_.data.process_context_.reset();
-        } else if (audio_control_shm_->envelope_active()) {
-            // Envelope active but host didn't provide a ProcessContext
-            // for this block.  Clear the flag so the consumer knows to
-            // trust the (also-absent) bitsery-decoded optional.
-            audio_control_shm_->layout().request_envelope_vst3.flags = 0;
+            uint32_t envelope_flags = 0;
+            uint32_t envelope_event_count = 0;
+
+            // P2: ProcessContext
+            if (process_request_.data.process_context_.has_value()) {
+                yabridge::nspa::process_context_to_direct(
+                    *process_request_.data.process_context_,
+                    env.process_context);
+                envelope_flags |= yabridge::nspa::
+                    vst3_envelope_flag_process_context_valid;
+                ctx_for_fallback =
+                    std::move(process_request_.data.process_context_);
+                process_request_.data.process_context_.reset();
+                envelope_publishes_context = true;
+            }
+
+            // P3: input_events_ (fixed-shape variants only)
+            if (process_request_.data.input_events_.has_value()) {
+                auto& list = *process_request_.data.input_events_;
+                const auto& evs = list.events_ref();
+                if (evs.size() <=
+                    yabridge::nspa::max_events_per_envelope) {
+                    bool all_fixed = true;
+                    for (size_t i = 0; i < evs.size(); i++) {
+                        if (!yabridge::nspa::yaevent_to_direct(
+                                evs[i], env.events[i])) {
+                            all_fixed = false;
+                            break;
+                        }
+                    }
+                    if (all_fixed) {
+                        envelope_event_count =
+                            static_cast<uint32_t>(evs.size());
+                        envelope_flags |= yabridge::nspa::
+                            vst3_envelope_flag_input_events_valid;
+                        list.swap_events(events_for_fallback);
+                        envelope_publishes_events = true;
+                    }
+                }
+            }
+
+            env.event_count = envelope_event_count;
+            env.flags = envelope_flags;
         }
 
         const size_t request_size =
@@ -336,12 +375,16 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
             // attach-failed instance below.
             //
             // Socket transport doesn't read the envelope, so we have to
-            // restore process_context_ into process_request_ before
-            // dispatching (we cleared it above to shrink the bitsery
-            // payload for the L2 path).
+            // restore every envelope-cleared field into process_request_
+            // before dispatching (we cleared them above to shrink the
+            // bitsery payload for the L2 path).
             if (envelope_publishes_context) {
                 process_request_.data.process_context_ =
                     std::move(ctx_for_fallback);
+            }
+            if (envelope_publishes_events) {
+                process_request_.data.input_events_->swap_events(
+                    events_for_fallback);
             }
             bridge_.receive_audio_processor_message_into(
                 MessageReference<YaAudioProcessor::Process>(process_request_),
@@ -376,14 +419,18 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
                     e.what());
             }
             if (!ok_dispatch) {
-                // Socket fallback path — restore process_context_ that
-                // the L2 path cleared so the bitsery serialization on
-                // the socket side includes correct transport info.
-                // Mirrors the request-size-overflow branch above and the
-                // VST2/CLAP equivalents.
+                // Socket fallback path — restore every envelope-cleared
+                // field that the L2 path cleared so the socket bitsery
+                // serialization includes correct request payload.
+                // Mirrors the request-size-overflow branch above and
+                // the VST2/CLAP equivalents.
                 if (envelope_publishes_context) {
                     process_request_.data.process_context_ =
                         std::move(ctx_for_fallback);
+                }
+                if (envelope_publishes_events) {
+                    process_request_.data.input_events_->swap_events(
+                        events_for_fallback);
                 }
                 bridge_.receive_audio_processor_message_into(
                     MessageReference<YaAudioProcessor::Process>(

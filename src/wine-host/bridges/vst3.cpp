@@ -2198,21 +2198,26 @@ size_t Vst3Bridge::register_object_instance(
                                     }
 
                                     // === NSPA L2 direct-struct envelope
-                                    //     override (P2: ProcessContext) ===
+                                    //     override ===
                                     //
                                     // When the creator opted in to the
-                                    // direct envelope path AND this block's
-                                    // envelope flag indicates a published
-                                    // ProcessContext, rehydrate
-                                    // process_context_ from the envelope.
-                                    // The bitsery payload above will have
-                                    // decoded an empty optional (producer
-                                    // cleared it after writing the
-                                    // envelope) so we materialize the
-                                    // optional here.  Fallback path
-                                    // (envelope_active false) leaves
-                                    // process_context_ as bitsery-decoded
-                                    // — strict same-as-before behavior.
+                                    // direct envelope path AND this
+                                    // block's envelope flags indicate
+                                    // published payload, rehydrate from
+                                    // the envelope.  The bitsery payload
+                                    // above has decoded with the
+                                    // envelope-cleared fields (producer
+                                    // cleared / extracted them after
+                                    // writing the envelope) so we
+                                    // materialize them here.
+                                    //   P2 — ProcessContext.
+                                    //   P3 — input_events_ (appended
+                                    //        to the already-engaged-
+                                    //        but-empty optional).
+                                    // Fallback path (envelope_active
+                                    // false or flag unset) leaves the
+                                    // bitsery-decoded value untouched —
+                                    // strict same-as-before behavior.
                                     if (inst->audio_control_shm
                                             ->envelope_active()) {
                                         const auto& env =
@@ -2229,6 +2234,31 @@ size_t Vst3Bridge::register_object_instance(
                                             inst->pi_cond_process_request.data
                                                 .process_context_ =
                                                 std::move(ctx);
+                                        }
+                                        if ((env.flags &
+                                             yabridge::nspa::
+                                                 vst3_envelope_flag_input_events_valid) &&
+                                            inst->pi_cond_process_request.data
+                                                .input_events_.has_value()) {
+                                            const uint32_t count =
+                                                env.event_count;
+                                            if (count <= yabridge::nspa::
+                                                    max_events_per_envelope)
+                                                [[likely]] {
+                                                auto& list = *inst
+                                                    ->pi_cond_process_request
+                                                    .data.input_events_;
+                                                list.reserve_events(count);
+                                                for (uint32_t i = 0;
+                                                     i < count; i++) {
+                                                    YaEvent y;
+                                                    yabridge::nspa::
+                                                        yaevent_from_direct(
+                                                            env.events[i], y);
+                                                    list.append_event(
+                                                        std::move(y));
+                                                }
+                                            }
                                         }
                                     }
 

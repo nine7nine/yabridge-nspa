@@ -266,6 +266,24 @@ class YaEventList : public Steinberg::Vst::IEventList {
         s.container(events_, 1 << 16);
     }
 
+    // L2 direct-struct envelope path support.  Used by the VST3
+    // plugin-proxy producer to extract events into a side buffer (so
+    // the bitsery encode of input_events_ ends up as an engaged-but-
+    // empty list, shrinking the L2 request payload), and by the
+    // wine-host consumer to refill events_ from the envelope after
+    // bitsery decode.  Swap is O(1) when on heap, O(N) on inline; both
+    // are RT-acceptable at typical event counts.
+    const llvm::SmallVector<YaEvent, 64>& events_ref() const noexcept {
+        return events_;
+    }
+    void swap_events(llvm::SmallVector<YaEvent, 64>& other) noexcept {
+        events_.swap(other);
+    }
+    void reserve_events(size_t n) { events_.reserve(n); }
+    void append_event(YaEvent&& e) noexcept {
+        events_.push_back(std::move(e));
+    }
+
    private:
     llvm::SmallVector<YaEvent, 64> events_;
 };
