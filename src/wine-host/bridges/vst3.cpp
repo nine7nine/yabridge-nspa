@@ -19,6 +19,7 @@
 #include <bitset>
 #include <optional>
 
+#include "../../common/serialization/vst3/direct-envelope.h"
 #include "../nspa_rt.h"
 #include "vst3-impls/component-handler-proxy.h"
 #include "vst3-impls/connection-point-proxy.h"
@@ -2194,6 +2195,41 @@ size_t Vst3Bridge::register_object_instance(
                                         throw std::runtime_error(
                                             "L2 VST3 Process "
                                             "deserialization failed");
+                                    }
+
+                                    // === NSPA L2 direct-struct envelope
+                                    //     override (P2: ProcessContext) ===
+                                    //
+                                    // When the creator opted in to the
+                                    // direct envelope path AND this block's
+                                    // envelope flag indicates a published
+                                    // ProcessContext, rehydrate
+                                    // process_context_ from the envelope.
+                                    // The bitsery payload above will have
+                                    // decoded an empty optional (producer
+                                    // cleared it after writing the
+                                    // envelope) so we materialize the
+                                    // optional here.  Fallback path
+                                    // (envelope_active false) leaves
+                                    // process_context_ as bitsery-decoded
+                                    // — strict same-as-before behavior.
+                                    if (inst->audio_control_shm
+                                            ->envelope_active()) {
+                                        const auto& env =
+                                            inst->audio_control_shm->layout()
+                                                .request_envelope_vst3;
+                                        if (env.flags &
+                                            yabridge::nspa::
+                                                vst3_envelope_flag_process_context_valid) {
+                                            Steinberg::Vst::ProcessContext
+                                                ctx{};
+                                            yabridge::nspa::
+                                                process_context_from_direct(
+                                                    env.process_context, ctx);
+                                            inst->pi_cond_process_request.data
+                                                .process_context_ =
+                                                std::move(ctx);
+                                        }
                                     }
 
                                     // Run the existing Process handler.

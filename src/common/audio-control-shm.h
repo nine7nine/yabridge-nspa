@@ -174,11 +174,75 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // builds, so peer + creator from different builds can detect mismatch on
 // attach and fall back to the bitsery+shmem path transparently.
 //
-// Version 1 = bitsery payload only (no direct-struct extension active).
-// Future commits add per-format direct-struct envelopes (ProcessContext
-// for VST3, VstTimeInfo for VST2, clap_event_transport_t for CLAP) and
-// bump this constant on each layout change.
-constexpr uint32_t audio_control_layout_version = 1;
+// Version 1 = bitsery payload only (Commit 1 scaffold; no direct-struct
+//             extension active).
+// Version 2 = VST3 request envelope with ProcessContext direct (this
+//             commit).  VST2 + CLAP envelopes added in subsequent
+//             commits, each bumping the version.
+constexpr uint32_t audio_control_layout_version = 2;
+
+// Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
+// Wire format only — producer (plugin-lib) and consumer (wine-host)
+// each convert to/from Steinberg::Vst::ProcessContext at their own
+// boundary.  Explicit-width fields + natural alignment + flattened
+// nested structs (Chord, FrameRate) to keep the layout ABI-stable
+// across the Linux-native plugin-lib side and the winegcc-built
+// wine-host PE side.  No vst3 SDK header is referenced here.
+//
+// Field order mirrors Steinberg::Vst::ProcessContext exactly so the
+// conversion at each side is straightforward field-by-field copying.
+struct ProcessContextDirect {
+    uint32_t state;                          // 0   StateAndFlags bitmask
+    uint32_t _pad0;                          // 4   align sample_rate to 8
+    double   sample_rate;                    // 8
+    int64_t  project_time_samples;           // 16
+    int64_t  system_time;                    // 24
+    int64_t  continous_time_samples;         // 32
+    double   project_time_music;             // 40
+    double   bar_position_music;             // 48
+    double   cycle_start_music;              // 56
+    double   cycle_end_music;                // 64
+    double   tempo;                          // 72
+    int32_t  time_sig_numerator;             // 80
+    int32_t  time_sig_denominator;           // 84
+    uint8_t  chord_key_note;                 // 88   Chord.keyNote
+    uint8_t  chord_root_note;                // 89   Chord.rootNote
+    int16_t  chord_mask;                     // 90   Chord.chordMask
+    int32_t  smpte_offset_subframes;         // 92
+    uint32_t frame_rate_fps;                 // 96   FrameRate.framesPerSecond
+    uint32_t frame_rate_flags;               // 100  FrameRate.flags
+    int32_t  samples_to_next_clock;          // 104
+    uint32_t _trail_pad;                     // 108  align struct size to 8
+};
+static_assert(sizeof(ProcessContextDirect) == 112,
+              "ProcessContextDirect ABI: 112-byte layout sanity check");
+static_assert(alignof(ProcessContextDirect) == 8,
+              "ProcessContextDirect ABI: 8-byte natural alignment");
+
+// VST3 request-direction envelope.  Carries fixed-shape per-block fields
+// that the direct-struct path replaces bitsery for.  Extends per phase:
+//   P2 (this commit) — ProcessContext only.
+//   P3 (future) — fixed-shape event ring.
+//   P4 (future) — parameter queue array.
+//
+// Layout: cacheline-aligned header (flags), then cacheline-aligned
+// payload(s).  All access happens under the L2 request pi_mutex, so
+// no atomic primitives are needed on internal fields.
+struct alignas(64) Vst3ProcessEnvelope {
+    // Header — first cacheline.  bit 0: process_context_valid.
+    uint32_t flags;
+    uint32_t _hdr_pad[15];                   // remainder of cacheline (60B)
+
+    // ProcessContext payload — starts at offset 64 (next cacheline).
+    ProcessContextDirect process_context;    // 112 bytes
+    // trailing pad to next 64-byte boundary handled by struct alignas
+};
+static_assert(sizeof(Vst3ProcessEnvelope) % 64 == 0,
+              "Vst3ProcessEnvelope must be a multiple of cacheline size");
+static_assert(alignof(Vst3ProcessEnvelope) == 64,
+              "Vst3ProcessEnvelope cacheline-aligned");
+static_assert(offsetof(Vst3ProcessEnvelope, process_context) == 64,
+              "process_context must start at offset 64 (own cacheline)");
 
 // Environment variable that opts INTO the direct-struct envelope path.
 // Default off — incremental rollout gate. Will be flipped to default-on
@@ -224,13 +288,38 @@ struct AudioControlShmLayout {
 
     alignas(64) uint8_t request_buf[audio_control_buf_size];
     alignas(64) uint8_t reply_buf[audio_control_buf_size];
+
+    // === NSPA L2 direct-struct envelope extension (commit 2+) ===
+    //
+    // Layout version + use-direct flag, cacheline-aligned header.  Both
+    // are written by the creator at Create time and read by the peer
+    // at Attach time.  Once Attach has completed, neither field is
+    // modified for the lifetime of the region.
+    //
+    // envelope_layout_version: creator writes audio_control_layout_version.
+    // Peer compares to its own compile-time value; mismatch → disable
+    // direct path, fall back to bitsery transparently.
+    //
+    // envelope_use_direct: 1 iff creator had YABRIDGE_DIRECT_ENVELOPE=1
+    // AND version match observed.  Both sides check this before
+    // writing/reading envelope payload fields.
+    alignas(64) std::atomic<uint32_t> envelope_layout_version;
+    uint32_t envelope_use_direct;
+    uint8_t _env_hdr_pad[64 - 8];
+
+    // Per-format request envelope sections.  Only the section for this
+    // instance's plugin format is populated; others stay zeroed.
+    // Sections appended per format in their commits — VST3 first
+    // (this commit), VST2 + CLAP follow.
+    alignas(64) Vst3ProcessEnvelope request_envelope_vst3;
 };
 
 static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
               "req_lock must be at offset 0 for ABI stability");
 static_assert(sizeof(AudioControlShmLayout) >=
-                  (2 * audio_control_buf_size + 320),
-              "layout sanity check");
+                  (2 * audio_control_buf_size + 320 + 64 +
+                   sizeof(Vst3ProcessEnvelope)),
+              "layout sanity check (with VST3 envelope extension)");
 
 // RAII handle to an AudioControlShm region. Holds the shm_open fd and
 // the mmap pointer. Constructor mode controls whether we create
@@ -271,6 +360,20 @@ class AudioControlShm {
     const std::string& name() const noexcept { return name_; }
     bool is_creator() const noexcept { return is_creator_; }
 
+    // Whether the direct-struct envelope path is active for THIS side
+    // of THIS region.  Set at construction time:
+    //   - Creator: true iff YABRIDGE_DIRECT_ENVELOPE=1 in env.
+    //   - Peer: true iff creator's envelope_layout_version matches the
+    //     peer's compile-time `audio_control_layout_version` AND the
+    //     creator set envelope_use_direct=1.
+    //
+    // Once set, this flag is stable for the lifetime of the region.
+    // RT-safe to query (plain bool, no atomic, no syscalls).  Call
+    // sites consult this per audio block to decide whether to read/
+    // write the envelope payload fields.  If false, the existing
+    // bitsery+shmem path is used unchanged.
+    bool envelope_active() const noexcept { return envelope_active_; }
+
     // Signal both sides to exit their loops. Atomically sets
     // state = Shutdown and broadcasts both conds so any waiter
     // (typically the wine-host audio thread blocked in pi_cond_wait
@@ -290,6 +393,7 @@ class AudioControlShm {
     AudioControlShmLayout* layout_ = nullptr;
     bool is_creator_ = false;
     bool is_moved_ = false;
+    bool envelope_active_ = false;
 };
 
 // =====================================================================

@@ -18,6 +18,7 @@
 
 #include <pluginterfaces/vst/ivstmidicontrollers.h>
 
+#include "../../../common/serialization/vst3/direct-envelope.h"
 #include "plug-view-proxy.h"
 
 /**
@@ -277,9 +278,54 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
         // separate process_buffers_ AudioShmBuffer — only metadata
         // (parameter changes, MIDI events, transport, channel pointers)
         // flows through pi_cond_req_buf_.
+        // === NSPA L2 direct-struct envelope write (P2: ProcessContext) ===
+        //
+        // When envelope_active() is true (creator opted in via
+        // YABRIDGE_DIRECT_ENVELOPE=1 AND version match observed at peer
+        // attach), publish the fixed-shape ProcessContext fields directly
+        // into the shmem envelope, then clear process_context_ from the
+        // bitsery-bound process_request_ so the subsequent
+        // quickSerialization encodes only the 1-byte "absent" optional
+        // tag instead of the full ~100-byte serialized struct.  Consumer
+        // sees the absent optional after bitsery decode and rehydrates
+        // process_context_ from the envelope.
+        //
+        // Save the cleared value into `ctx_for_fallback` so that if
+        // bitsery size exceeds the 64 KiB region budget (the rare
+        // over-budget path) we can restore process_context_ and use the
+        // socket transport — which doesn't read the envelope and
+        // therefore needs process_context_ in its bitsery payload.
+        //
+        // Writes happen-before audio_control_send_and_wait's
+        // release-store of state inside the request pi_mutex.  The
+        // consumer's matching acquire-load on state observing
+        // RequestReady synchronizes-with the producer's release-store,
+        // making these envelope writes visible.  No explicit fence.
+        std::optional<Steinberg::Vst::ProcessContext> ctx_for_fallback;
+        const bool envelope_publishes_context =
+            audio_control_shm_->envelope_active() &&
+            process_request_.data.process_context_.has_value();
+        if (envelope_publishes_context) {
+            auto& env = audio_control_shm_->layout().request_envelope_vst3;
+            yabridge::nspa::process_context_to_direct(
+                *process_request_.data.process_context_,
+                env.process_context);
+            env.flags =
+                yabridge::nspa::vst3_envelope_flag_process_context_valid;
+            ctx_for_fallback =
+                std::move(process_request_.data.process_context_);
+            process_request_.data.process_context_.reset();
+        } else if (audio_control_shm_->envelope_active()) {
+            // Envelope active but host didn't provide a ProcessContext
+            // for this block.  Clear the flag so the consumer knows to
+            // trust the (also-absent) bitsery-decoded optional.
+            audio_control_shm_->layout().request_envelope_vst3.flags = 0;
+        }
+
         const size_t request_size =
             bitsery::quickSerialization<OutputAdapter<SerializationBufferBase>>(
                 pi_cond_req_buf_, process_request_);
+
         if (request_size > yabridge::nspa::audio_control_buf_size)
             [[unlikely]] {
             // Process metadata exceeded the shmem region — exceptionally
@@ -288,6 +334,15 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
             // block. Fall back to the socket transport for just this
             // call rather than failing audio. Same code path as the
             // attach-failed instance below.
+            //
+            // Socket transport doesn't read the envelope, so we have to
+            // restore process_context_ into process_request_ before
+            // dispatching (we cleared it above to shrink the bitsery
+            // payload for the L2 path).
+            if (envelope_publishes_context) {
+                process_request_.data.process_context_ =
+                    std::move(ctx_for_fallback);
+            }
             bridge_.receive_audio_processor_message_into(
                 MessageReference<YaAudioProcessor::Process>(process_request_),
                 process_response_);

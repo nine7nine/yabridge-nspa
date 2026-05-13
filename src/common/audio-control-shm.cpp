@@ -18,6 +18,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 
@@ -132,6 +133,25 @@ AudioControlShm::AudioControlShm(Create, const std::string& name)
     layout_->request_size = 0;
     layout_->reply_size = 0;
     layout_->generation = 1;
+
+    // === NSPA L2 direct-struct envelope extension init ===
+    //
+    // Creator writes both layout version and use-direct flag.  Peer
+    // reads these on Attach and computes its own local envelope_active_
+    // (with version-match check).
+    //
+    // envelope_use_direct = 1 iff YABRIDGE_DIRECT_ENVELOPE=1 in this
+    // process's env.  Direct path is opt-in; default off.
+    //
+    // Per-format envelope sections are zeroed.  Wine PE-side peer
+    // expects a zeroed envelope on first attach; subsequent producer
+    // writes happen under the request pi_mutex.
+    envelope_active_ = direct_envelope_enabled();
+    layout_->envelope_layout_version.store(audio_control_layout_version,
+                                           std::memory_order_release);
+    layout_->envelope_use_direct = envelope_active_ ? 1u : 0u;
+    std::memset(&layout_->request_envelope_vst3, 0,
+                sizeof(layout_->request_envelope_vst3));
 }
 
 AudioControlShm::AudioControlShm(Attach, const std::string& name)
@@ -159,6 +179,28 @@ AudioControlShm::AudioControlShm(Attach, const std::string& name)
     // Peer does NOT re-init the pi_mutex / pi_cond pairs — they're
     // already alive (initialized by the creator). Re-initializing
     // would clobber any in-flight waiters.
+
+    // === NSPA L2 direct-struct envelope extension peer check ===
+    //
+    // Read creator's layout version and use-direct flag.  If version
+    // matches our compile-time `audio_control_layout_version` AND
+    // creator opted into direct path, peer activates direct path
+    // locally.  Otherwise stays off and the bitsery+shmem path runs
+    // unchanged — strict, transparent fallback.
+    //
+    // We read envelope_layout_version with acquire ordering to pair
+    // with the creator's release-store at the end of Create.  This
+    // ensures the rest of the envelope memory (request_envelope_vst3
+    // = zeroed) is visible to us.
+    const uint32_t creator_version =
+        layout_->envelope_layout_version.load(std::memory_order_acquire);
+    const uint32_t creator_use_direct = layout_->envelope_use_direct;
+    if (creator_version == audio_control_layout_version &&
+        creator_use_direct == 1u) {
+        envelope_active_ = true;
+    } else {
+        envelope_active_ = false;
+    }
 }
 
 AudioControlShm::~AudioControlShm() noexcept {
@@ -214,10 +256,12 @@ AudioControlShm::AudioControlShm(AudioControlShm&& o) noexcept
       fd_(o.fd_),
       layout_(o.layout_),
       is_creator_(o.is_creator_),
-      is_moved_(false) {
+      is_moved_(false),
+      envelope_active_(o.envelope_active_) {
     o.is_moved_ = true;
     o.fd_ = -1;
     o.layout_ = nullptr;
+    o.envelope_active_ = false;
 }
 
 // =====================================================================
