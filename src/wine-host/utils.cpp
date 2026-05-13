@@ -58,12 +58,32 @@ std::optional<std::string> wine_convert_to_dos(const std::string& unix_path) {
     if (!converted) return std::nullopt;
 
     static_assert(sizeof(WCHAR) == sizeof(char16_t));
-    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
-    std::string result = converter.to_bytes(
-        std::u16string(reinterpret_cast<char16_t*>(converted)));
+    // wstring_convert::to_bytes throws std::range_error on conversion
+    // failure (malformed UTF-16 input).  Caller (to_dos_path) is
+    // declared noexcept and would terminate on escape.  Catch here and
+    // return nullopt so the caller naturally falls through to
+    // manual_dosdevices_lookup.  Same noexcept-violation bug class as
+    // editor.cpp::redetect_host_window fixed in commit 1f979647 — see
+    // ~/wine-nspa-notes/yabridge-noexcept-audit-20260513.md.
+    //
+    // Always HeapFree the Wine-allocated buffer before returning,
+    // regardless of conversion outcome.
+    std::optional<std::string> result;
+    try {
+        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>
+            converter;
+        result = converter.to_bytes(
+            std::u16string(reinterpret_cast<char16_t*>(converted)));
+    } catch (const std::range_error&) {
+        // Malformed UTF-16 from Wine — extremely unlikely for a real
+        // file path, but defensively return nullopt rather than letting
+        // the exception escape the noexcept boundary at to_dos_path.
+    }
     HeapFree(GetProcessHeap(), 0, converted);
 
-    if (result.compare(0, 8, "\\\\?\\unix") == 0) return std::nullopt;
+    if (!result || result->compare(0, 8, "\\\\?\\unix") == 0) {
+        return std::nullopt;
+    }
     return result;
 }
 
