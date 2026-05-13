@@ -449,6 +449,22 @@ Steinberg::IPluginFactory* Vst3PluginBridge::get_plugin_factory() {
     return plugin_factory_;
 }
 
+// L2 — derive the same deterministic shm name the wine-host bridge
+// computes in Vst3Bridge::nspa_audio_control_shm_name. sockets_.base_dir_
+// is the identical path on both sides (passed from plugin-lib to wine-host
+// at startup), so sanitizing + suffixing instance_id yields a match.
+std::string Vst3PluginBridge::nspa_audio_control_shm_name(
+    size_t instance_id) const {
+    std::string token = sockets_.base_dir_.filename().string();
+    for (char& c : token) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+              c == '-' || c == '_' || c == '.')) {
+            c = '_';
+        }
+    }
+    return "/" + token + "-vst3-" + std::to_string(instance_id) + ".audio_ctl";
+}
+
 std::pair<Vst3PluginProxyImpl&, std::shared_lock<std::shared_mutex>>
 Vst3PluginBridge::get_proxy(size_t instance_id) noexcept {
     std::shared_lock lock(plugin_proxies_mutex_);

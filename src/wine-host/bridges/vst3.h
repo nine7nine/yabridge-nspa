@@ -16,13 +16,17 @@
 
 #pragma once
 
+#include <atomic>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 
 #include <public.sdk/source/vst/hosting/module.h>
 
+#include "../../common/audio-control-shm.h"
+#include "../../common/communication/common.h"  // for SerializationBuffer<N>
 #include "../../common/communication/vst3.h"
 #include "../../common/configuration.h"
 #include "../../common/mutual-recursion.h"
@@ -106,6 +110,41 @@ struct Vst3PluginInterfaces {
  */
 struct Vst3PluginInstance {
     Vst3PluginInstance(Steinberg::IPtr<Steinberg::FUnknown> object) noexcept;
+    ~Vst3PluginInstance() noexcept;
+
+    // L2 — pi_cond audio rendezvous for IAudioProcessor::process. Declared
+    // FIRST in the struct so it destructs LAST (after both Win32Thread
+    // members join). Lifecycle mirrors the VST2 pattern:
+    //
+    //   1. ~Vst3PluginInstance body signals shutdown on audio_control_shm.
+    //   2. audio_processor_handler (declared later) joins first; it parks
+    //      on the audio socket which is closed by remove_audio_processor.
+    //   3. audio_process_handler joins next; it parks on pi_cond_wait
+    //      which wakes via the shutdown signal.
+    //   4. audio_control_shm destructs (unmaps shmem). By this point both
+    //      audio-side threads are gone, no UAF.
+    //
+    // Created wine-host-side in register_object_instance with a
+    // deterministic name (sockets_.base_dir basename + "-vst3-" +
+    // instance_id). Plugin-lib attaches by the same name after receiving
+    // the Construct response. Creation failure (perms, /dev/shm
+    // exhaustion) leaves nullopt and the audio path falls back to the
+    // existing socket transport — both wine-host threads coexist.
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm;
+    std::atomic<bool> audio_loop_stop{false};
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_local;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_local;
+    // Reusable per-instance Process request/response — same allocation-
+    // free pattern as plugin-lib's process_request_ / process_response_.
+    YaAudioProcessor::Process pi_cond_process_request;
+    YaAudioProcessor::ProcessResponse pi_cond_process_response;
+    // L2 — dedicated Win32Thread that services Process via pi_cond.
+    // Declared AFTER audio_control_shm so it destructs BEFORE the shmem
+    // (joins while shmem still mapped). Non-Process audio messages stay
+    // on audio_processor_handler / the audio socket.
+    Win32Thread audio_process_handler;
 
     /**
      * A dedicated thread for handling incoming `IAudioProcessor` and
@@ -495,6 +534,21 @@ class Vst3Bridge : public HostBridge {
      * `IAudioProcessor`/`IComponent` socket if it had one.
      */
     void unregister_object_instance(size_t instance_id);
+
+    // Run an `IAudioProcessor::process()` call on the wine-host side.
+    // Extracted from the audio_processor_handler overload so both transport
+    // paths (socket + L2 pi_cond) share identical semantics — verbatim
+    // relocation from the inline lambda.
+    YaAudioProcessor::ProcessResponse handle_process(
+        YaAudioProcessor::Process& request);
+
+    // L2 — derive the deterministic POSIX shm name for the per-instance
+    // pi_cond audio rendezvous region from `sockets_.base_dir_` (which is
+    // the same path on both sides) and `instance_id`. Wine-host creates
+    // with this name in `register_object_instance`; plugin-lib attaches
+    // with the same name in `Vst3PluginProxyImpl`'s constructor. Chars
+    // unsafe for shm_open in the prefix basename are sanitized to `_`.
+    std::string nspa_audio_control_shm_name(size_t instance_id) const;
 
     /**
      * The configuration for this instance of yabridge based on the `.so` file

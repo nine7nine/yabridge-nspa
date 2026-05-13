@@ -190,6 +190,19 @@ class Vst3PluginBridge : PluginBridge<Vst3Sockets<std::jthread>> {
         return mutual_recursion_.maybe_handle(std::forward<F>(fn));
     }
 
+    // L2 — deterministic POSIX shm name for the per-instance pi_cond
+    // audio rendezvous region. Mirrors Vst3Bridge::nspa_audio_control_shm_name
+    // on the wine-host side: both sides derive the same name from
+    // sockets_.base_dir_ (the unique yabridge socket dir, identical on
+    // both sides) and the instance_id assigned by wine-host's
+    // generate_instance_id. Wine-host CREATES this region during
+    // register_object_instance, before sending the Construct response.
+    // By the time plugin-lib receives the response and calls this helper
+    // to attach, the region is already initialized — synchronous protocol
+    // ordering on the control socket gives us a race-free handshake
+    // without a wire-format change.
+    std::string nspa_audio_control_shm_name(size_t instance_id) const;
+
     /**
      * The logging facility used for this instance of yabridge. Wraps around
      * `PluginBridge::generic_logger`.

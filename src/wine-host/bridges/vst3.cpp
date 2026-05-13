@@ -87,6 +87,27 @@ Vst3PluginInstance::Vst3PluginInstance(
       // future might bring)
       is_initialized(!interfaces.plugin_base) {}
 
+// L2 — signal shutdown so the audio_process_handler thread wakes from
+// pi_cond_wait and exits. The thread is parked in audio_control_recv_one;
+// signal_shutdown sets state=Shutdown and broadcasts both cond vars, which
+// causes audio_control_recv_one to throw AudioControlShutdown. The
+// surrounding loop catches it and returns. After this body returns, member
+// destruction runs in reverse declaration order: audio_processor_handler
+// joins (socket already closed by unregister_object_instance), then
+// audio_process_handler joins (thread already exited via the shutdown
+// signal we just sent), then finally audio_control_shm destructs (the
+// shmem stays mapped through both joins so neither thread sees UAF).
+//
+// signal_shutdown is noexcept and idempotent (broadcasts on cv with no
+// waiters are no-ops), so calling it here when unregister_object_instance
+// has already called it is harmless.
+Vst3PluginInstance::~Vst3PluginInstance() noexcept {
+    audio_loop_stop.store(true, std::memory_order_release);
+    if (audio_control_shm) {
+        audio_control_shm->signal_shutdown();
+    }
+}
+
 Vst3Bridge::Vst3Bridge(MainContext& main_context,
                        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                        std::string plugin_dll_path,
@@ -1716,6 +1737,57 @@ std::optional<AudioShmBuffer::Config> Vst3Bridge::setup_shared_audio_buffers(
     return buffer_config;
 }
 
+// L2 — deterministic shm name. sockets_.base_dir_ basename is the unique
+// yabridge socket directory (e.g. "yabridge-Chromaphone-4BCEFPTk"); both
+// sides compute the same name. Sanitize any chars that aren't safe in a
+// shm_open name (the leading '/' is the only allowed slash). instance_id
+// distinguishes per-plugin-instance regions within a single bridge.
+std::string Vst3Bridge::nspa_audio_control_shm_name(size_t instance_id) const {
+    std::string token = sockets_.base_dir_.filename().string();
+    for (char& c : token) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+              c == '-' || c == '_' || c == '.')) {
+            c = '_';
+        }
+    }
+    return "/" + token + "-vst3-" + std::to_string(instance_id) + ".audio_ctl";
+}
+
+YaAudioProcessor::ProcessResponse Vst3Bridge::handle_process(
+    YaAudioProcessor::Process& request) {
+    const auto& [instance, _] = get_instance(request.instance_id);
+    // Most plugins will already enable FTZ, but there are a handful of
+    // plugins that don't that suffer from extreme DSP load increases when
+    // they start producing denormals
+    ScopedFlushToZero ftz_guard;
+
+    // The actual audio is stored in the shared memory buffers, so the
+    // reconstruction function will need to know where it should point the
+    // `AudioBusBuffers` to
+    // HACK: IK-Multimedia's T-RackS 5 will hang if audio processing is
+    //       done from the audio thread while the plugin is in offline
+    //       processing mode. Yes that's as silly as it sounds.
+    tresult result;
+    auto& reconstructed = request.data.reconstruct(
+        instance.process_buffers_input_pointers,
+        instance.process_buffers_output_pointers);
+    if (instance.process_setup &&
+        instance.process_setup->processMode == Steinberg::Vst::kOffline) {
+        result = main_context_
+                     .run_in_context(
+                         [&instance = instance, &reconstructed]() {
+                             return instance.interfaces.audio_processor
+                                 ->process(reconstructed);
+                         })
+                     .get();
+    } else {
+        result = instance.interfaces.audio_processor->process(reconstructed);
+    }
+
+    return YaAudioProcessor::ProcessResponse{
+        .result = result, .output_data = request.data.create_response()};
+}
+
 size_t Vst3Bridge::register_object_instance(
     Steinberg::IPtr<Steinberg::FUnknown> object) {
     std::unique_lock lock(object_instances_mutex_);
@@ -1728,6 +1800,46 @@ size_t Vst3Bridge::register_object_instance(
     // those interfaces.
     if (object_instances_.at(instance_id).interfaces.audio_processor ||
         object_instances_.at(instance_id).interfaces.component) {
+        // L2 — try to create the per-instance pi_cond audio rendezvous
+        // region BEFORE spawning either audio-side Win32Thread. Wine-host
+        // is the CREATOR for VST3 (unlike VST2 where plugin-lib creates):
+        // we know instance_id here and the deterministic name derives
+        // from it, so plugin-lib will attach after receiving the Construct
+        // response. On any creation failure (perms, /dev/shm exhaustion,
+        // stale region) leave the optional empty and fall through to the
+        // socket-only path — both transports coexist; the audio thread
+        // for whichever side plugin-lib opts into parks waiting.
+        //
+        // NOTE: emplace above may have invalidated existing iterators
+        //       if it rehashed, but pointers/references to map elements
+        //       remain valid. We use object_instances_.at(...) for the
+        //       fresh lookup.
+        {
+            Vst3PluginInstance& inst = object_instances_.at(instance_id);
+            const std::string shm_name = nspa_audio_control_shm_name(instance_id);
+            try {
+                inst.audio_control_shm.emplace(
+                    yabridge::nspa::AudioControlShm::Create{}, shm_name);
+                // Pre-size the local copy buffers used by the L2 thread
+                // for pi_cond request reception + ProcessResponse
+                // serialization. .data() must be valid for the full
+                // inline capacity. quickSerialization on the reply path
+                // resizes within inline storage.
+                inst.pi_cond_req_local.resize(
+                    yabridge::nspa::audio_control_buf_size);
+                inst.pi_cond_reply_local.reserve(
+                    yabridge::nspa::audio_control_buf_size);
+            } catch (const std::exception& e) {
+                logger_.log(
+                    std::string("L2 VST3 pi_cond audio rendezvous setup "
+                                "failed (name='") +
+                    shm_name + "'): " + e.what() +
+                    " — falling back to socket transport for this "
+                    "instance.");
+                // inst.audio_control_shm remains nullopt
+            }
+        }
+
         std::promise<void> socket_listening_latch;
 
         object_instances_.at(instance_id)
@@ -1845,47 +1957,14 @@ size_t Vst3Bridge::register_object_instance(
                         //       store a reference to it in our variant (this is
                         //       done during the deserialization in
                         //       `bitsery::ext::MessageReference`)
-                        YaAudioProcessor::Process& request = request_ref.get();
-
-                        const auto& [instance, _] =
-                            get_instance(request.instance_id);
-                        // Most plugins will already enable FTZ, but there are a
-                        // handful of plugins that don't that suffer from
-                        // extreme DSP load increases when they start producing
-                        // denormals
-                        ScopedFlushToZero ftz_guard;
-
-                        // The actual audio is stored in the shared memory
-                        // buffers, so the reconstruction function will need to
-                        // know where it should point the `AudioBusBuffers` to
-                        // HACK: IK-Multimedia's T-RackS 5 will hang if audio
-                        //       processing is done from the audio thread while
-                        //       the plugin is in offline processing mode. Yes
-                        //       that's as silly as it sounds.
-                        tresult result;
-                        auto& reconstructed = request.data.reconstruct(
-                            instance.process_buffers_input_pointers,
-                            instance.process_buffers_output_pointers);
-                        if (instance.process_setup &&
-                            instance.process_setup->processMode ==
-                                Steinberg::Vst::kOffline) {
-                            result = main_context_
-                                         .run_in_context([&instance = instance,
-                                                          &reconstructed]() {
-                                             return instance.interfaces
-                                                 .audio_processor->process(
-                                                     reconstructed);
-                                         })
-                                         .get();
-                        } else {
-                            result =
-                                instance.interfaces.audio_processor->process(
-                                    reconstructed);
-                        }
-
-                        return YaAudioProcessor::ProcessResponse{
-                            .result = result,
-                            .output_data = request.data.create_response()};
+                        //
+                        // L2: when audio_control_shm is set on this instance,
+                        // plugin-lib routes Process through pi_cond instead
+                        // of this socket, so this lambda body becomes the
+                        // socket-fallback path. Either way the dispatch
+                        // semantics are identical — relocated into
+                        // handle_process so both transports share one body.
+                        return handle_process(request_ref.get());
                     },
                     [&](const YaAudioProcessor::GetTailSamples& request)
                         -> YaAudioProcessor::GetTailSamples::Response {
@@ -2027,6 +2106,124 @@ size_t Vst3Bridge::register_object_instance(
         // continuing. Otherwise the native plugin may try to
         // connect to it before our thread is up and running.
         socket_listening_latch.get_future().wait();
+
+        // L2 — Process-only pi_cond thread. Plugin-lib chooses transport
+        // per call: when it has attached the shmem, it sends Process via
+        // pi_cond and this thread services it; otherwise Process arrives
+        // on the audio socket above and falls through to handle_process
+        // through the socket lambda. Both paths share handle_process.
+        //
+        // Lock discipline: the thread captures only instance_id by value;
+        // it looks up the per-instance state ONCE on entry via
+        // get_instance (briefly held shared_lock), then drops the lock
+        // and uses the stable pointer for the remainder of its lifetime.
+        // unordered_map references survive past insert/emplace; the entry
+        // is only invalidated by erase, which unregister_object_instance
+        // sequences AFTER signal_shutdown — so by the time the map entry
+        // could be removed, this thread has already exited its loop.
+        // The pi_cond_wait that follows MUST NOT hold any object_instances_
+        // lock or unregister_object_instance's unique_lock during erase
+        // would deadlock against the audio thread.
+        if (object_instances_.at(instance_id).audio_control_shm) {
+            object_instances_.at(instance_id).audio_process_handler =
+                Win32Thread([this, instance_id]() {
+                    yabridge::nspa::set_thread_time_critical();
+                    const std::string thread_name =
+                        "audio-pi-" + std::to_string(instance_id);
+                    pthread_setname_np(pthread_self(), thread_name.c_str());
+
+                    Vst3PluginInstance* inst;
+                    {
+                        auto [instance, lock] = get_instance(instance_id);
+                        inst = &instance;
+                    }
+                    // ===== shared_lock dropped; pointer remains valid =====
+
+                    while (!inst->audio_loop_stop.load(
+                        std::memory_order_acquire)) {
+                        try {
+                            yabridge::nspa::audio_control_recv_one(
+                                *inst->audio_control_shm,
+                                inst->pi_cond_req_local.data(),
+                                yabridge::nspa::audio_control_buf_size,
+                                inst->pi_cond_reply_local.data(),
+                                yabridge::nspa::audio_control_buf_size,
+                                [&](const uint8_t* req_bytes, size_t req_size,
+                                    uint8_t* reply_out,
+                                    size_t reply_capacity) -> size_t {
+                                    (void)req_bytes;
+                                    // Deserialize Process request directly
+                                    // into the per-instance reusable
+                                    // request object — same pattern as
+                                    // the socket transport's
+                                    // MessageReference<Process> with
+                                    // receive_messages<true>. No heap on
+                                    // the audio path.
+                                    auto [_, ok] =
+                                        bitsery::quickDeserialization<
+                                            InputAdapter<
+                                                SerializationBufferBase>>(
+                                            {inst->pi_cond_req_local.begin(),
+                                             req_size},
+                                            inst->pi_cond_process_request);
+                                    if (!ok) [[unlikely]] {
+                                        throw std::runtime_error(
+                                            "L2 VST3 Process "
+                                            "deserialization failed");
+                                    }
+
+                                    // Run the existing Process handler.
+                                    // No cross-process lock held during
+                                    // plugin processing.
+                                    inst->pi_cond_process_response =
+                                        handle_process(
+                                            inst->pi_cond_process_request);
+
+                                    // Serialize ProcessResponse into
+                                    // pi_cond_reply_local. The response
+                                    // contains pointers back into the
+                                    // request data (see
+                                    // YaProcessData::create_response), so
+                                    // we serialize before
+                                    // pi_cond_process_request is touched
+                                    // by the next iteration.
+                                    const size_t reply_size =
+                                        bitsery::quickSerialization<
+                                            OutputAdapter<
+                                                SerializationBufferBase>>(
+                                            inst->pi_cond_reply_local,
+                                            inst->pi_cond_process_response);
+                                    if (reply_size > reply_capacity)
+                                        [[unlikely]] {
+                                        throw std::overflow_error(
+                                            "L2 VST3 Process reply too "
+                                            "large for reply buffer");
+                                    }
+
+                                    // Defensive copy if quickSerialization
+                                    // somehow moved the buffer to heap
+                                    // (shouldn't happen within the inline
+                                    // 64 KiB capacity for ProcessResponse
+                                    // metadata — actual audio lives in
+                                    // process_buffers).
+                                    if (inst->pi_cond_reply_local.data() !=
+                                        reply_out) {
+                                        std::memcpy(
+                                            reply_out,
+                                            inst->pi_cond_reply_local.data(),
+                                            reply_size);
+                                    }
+                                    return reply_size;
+                                });
+                        } catch (const yabridge::nspa::AudioControlShutdown&) {
+                            // Teardown signaled; exit cleanly.
+                            break;
+                        }
+                        // Other exceptions propagate out of the thread —
+                        // same behaviour as the socket loop on error.
+                    }
+                });
+        }
     }
 
     return instance_id;
@@ -2037,6 +2234,21 @@ void Vst3Bridge::unregister_object_instance(size_t instance_id) {
     // created one during `Vst3PluginProxy::Construct`
     if (const auto& [instance, _] = get_instance(instance_id);
         instance.interfaces.audio_processor || instance.interfaces.component) {
+        // L2: signal shutdown BEFORE remove_audio_processor so the
+        // audio_process_handler thread (parked in pi_cond_wait inside
+        // audio_control_recv_one) wakes immediately and exits its loop.
+        // Closing the audio socket via remove_audio_processor only wakes
+        // audio_processor_handler — the L2 thread is not on the socket.
+        // Order matters: when the map erase below runs and triggers the
+        // Vst3PluginInstance destructor, both Win32Threads must have
+        // already exited so their destructors join cleanly.
+        //
+        // signal_shutdown is noexcept and re-running it via the destructor
+        // is harmless (broadcast on cv with no waiters is a no-op).
+        instance.audio_loop_stop.store(true, std::memory_order_release);
+        if (instance.audio_control_shm) {
+            instance.audio_control_shm->signal_shutdown();
+        }
         sockets_.remove_audio_processor(instance_id);
     }
 

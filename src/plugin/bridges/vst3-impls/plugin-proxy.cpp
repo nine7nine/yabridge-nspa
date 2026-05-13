@@ -45,6 +45,38 @@ Vst3PluginProxyImpl::Vst3PluginProxyImpl(Vst3PluginBridge& bridge,
                                          Vst3PluginProxy::ConstructArgs&& args)
     : Vst3PluginProxy(std::move(args)), bridge_(bridge) {
     bridge.register_plugin_proxy(*this);
+
+    // L2 — attempt to attach the per-instance pi_cond audio rendezvous
+    // region the wine-host bridge created during register_object_instance.
+    // The Construct request/response on the control socket is synchronous,
+    // so by the time this constructor runs (after Construct returned),
+    // wine-host has already created the shmem with this exact name. If
+    // attach fails — typically because the plugin has no IAudioProcessor
+    // (wine-host only creates for audio_processor || component) or the
+    // wine-host predecessor crashed leaving a stale region we can't read
+    // — we leave it nullopt and process() falls back to the audio socket.
+    if (YaAudioProcessor::supported() || YaComponent::supported()) {
+        const std::string shm_name =
+            bridge_.nspa_audio_control_shm_name(instance_id());
+        try {
+            audio_control_shm_.emplace(
+                yabridge::nspa::AudioControlShm::Attach{}, shm_name);
+            // Pre-size the reply receive buffer. process() will write
+            // serialized Process bytes into pi_cond_req_buf_ (resized as
+            // needed by quickSerialization) and read deserialized
+            // ProcessResponse bytes from pi_cond_reply_buf_ (which needs
+            // .data() valid for the full inline capacity since the
+            // pi_cond helper memcpys into it before bitsery reads).
+            pi_cond_reply_buf_.resize(yabridge::nspa::audio_control_buf_size);
+        } catch (const std::exception& e) {
+            bridge_.logger_.log(
+                std::string("L2 VST3 pi_cond audio rendezvous attach failed "
+                            "(name='") +
+                shm_name + "'): " + e.what() +
+                " — falling back to socket transport for this instance.");
+            // audio_control_shm_ remains nullopt
+        }
+    }
 }
 
 Vst3PluginProxyImpl::~Vst3PluginProxyImpl() noexcept {
@@ -215,7 +247,9 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
     // We reuse this existing object to avoid allocations.
     // `YaProcessData::repopulate()` will write the input audio to the shared
     // audio buffers, so they're not stored within the request object itself.
-    assert(process_buffers_);
+    if (!process_buffers_) [[unlikely]] {
+        return Steinberg::kInternalError;
+    }
     process_request_.instance_id = instance_id();
     process_request_.data.repopulate(data, *process_buffers_);
 
@@ -233,11 +267,72 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
     //       clearer.
     process_response_.output_data = process_request_.data.create_response();
 
-    // We'll also receive the response into an existing object so we can also
-    // avoid heap allocations there
-    bridge_.receive_audio_processor_message_into(
-        MessageReference<YaAudioProcessor::Process>(process_request_),
-        process_response_);
+    if (audio_control_shm_) [[likely]] {
+        // L2 — pi_cond+pi_mutex transport. Cross-process priority
+        // inheritance handoff: the FUTEX_CMP_REQUEUE_PI signal applies
+        // this thread's (the DAW audio thread's) effective priority to
+        // the wine-host audio_process_handler thread. The shmem region's
+        // request_buf is bounded at audio_control_buf_size; large
+        // ProcessData (many channels × large block size) is in the
+        // separate process_buffers_ AudioShmBuffer — only metadata
+        // (parameter changes, MIDI events, transport, channel pointers)
+        // flows through pi_cond_req_buf_.
+        const size_t request_size =
+            bitsery::quickSerialization<OutputAdapter<SerializationBufferBase>>(
+                pi_cond_req_buf_, process_request_);
+        if (request_size > yabridge::nspa::audio_control_buf_size)
+            [[unlikely]] {
+            // Process metadata exceeded the shmem region — exceptionally
+            // unusual (the AudioControlShm region is 64 KiB), but the
+            // VST3 spec allows arbitrarily many parameter changes per
+            // block. Fall back to the socket transport for just this
+            // call rather than failing audio. Same code path as the
+            // attach-failed instance below.
+            bridge_.receive_audio_processor_message_into(
+                MessageReference<YaAudioProcessor::Process>(process_request_),
+                process_response_);
+        } else {
+            size_t reply_size = 0;
+            bool ok_dispatch = false;
+            try {
+                yabridge::nspa::audio_control_send_and_wait(
+                    *audio_control_shm_, pi_cond_req_buf_.data(), request_size,
+                    pi_cond_reply_buf_.data(),
+                    yabridge::nspa::audio_control_buf_size, reply_size);
+
+                // Deserialize ProcessResponse directly into the reusable
+                // process_response_ object (whose output_data fields point
+                // back into process_request_.data — see the create_response
+                // dance above). No heap allocation in the audio path.
+                auto [_, deser_ok] = bitsery::quickDeserialization<
+                    InputAdapter<SerializationBufferBase>>(
+                    {pi_cond_reply_buf_.begin(), reply_size},
+                    process_response_);
+                if (!deser_ok) [[unlikely]] {
+                    throw std::runtime_error(
+                        "L2 VST3 ProcessResponse deserialization failed");
+                }
+                ok_dispatch = true;
+            } catch (const std::exception& e) {
+                bridge_.logger_.log(
+                    std::string(
+                        "L2 VST3 pi_cond audio transport error, dropping to "
+                        "socket transport for this call: ") +
+                    e.what());
+            }
+            if (!ok_dispatch) {
+                bridge_.receive_audio_processor_message_into(
+                    MessageReference<YaAudioProcessor::Process>(
+                        process_request_),
+                    process_response_);
+            }
+        }
+    } else {
+        // Socket fallback — same as upstream.
+        bridge_.receive_audio_processor_message_into(
+            MessageReference<YaAudioProcessor::Process>(process_request_),
+            process_response_);
+    }
 
     // At this point the shared audio buffers should contain the output audio,
     // so we'll write that back to the host along with any metadata (which in

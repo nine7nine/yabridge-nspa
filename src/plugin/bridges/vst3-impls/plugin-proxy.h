@@ -17,7 +17,9 @@
 #pragma once
 
 #include <map>
+#include <optional>
 
+#include "../../../common/audio-control-shm.h"
 #include "../vst3.h"
 #include "plug-view-proxy.h"
 
@@ -461,6 +463,28 @@ class Vst3PluginProxyImpl : public Vst3PluginProxy {
      * contains heap data, so we also want to reuse this.
      */
     YaAudioProcessor::ProcessResponse process_response_;
+
+    // L2 — per-instance pi_cond audio rendezvous attached during this
+    // proxy's constructor (wine-host created it during register_object_instance
+    // before sending the Construct response, so synchronous control-socket
+    // ordering guarantees the region exists by the time we attach). On
+    // any attach failure (mmap, perms, stale region from a crashed
+    // wine-host predecessor) this stays nullopt and process() falls back
+    // to the existing per-instance audio socket — both paths are wired
+    // and the wine-host bridge has the matching audio_process_handler /
+    // audio_processor_handler threads ready for either transport.
+    //
+    // Lifetime: members destruct in reverse declaration order. Since the
+    // pi_cond_*_buf_ buffers below are only touched by process() (which
+    // is no longer invoked once the host has finished playback and is
+    // tearing this proxy down), the destructor ordering is not safety-
+    // critical here — but for symmetry with the wine-host side, the
+    // shm member is declared FIRST so it destructs LAST.
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_buf_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_buf_;
 
     /**
      * A shared memory object to share audio buffers between the native plugin
