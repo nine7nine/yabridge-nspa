@@ -117,7 +117,17 @@ Vst3Bridge::Vst3Bridge(MainContext& main_context,
       logger_(generic_logger_),
       sockets_(main_context.context_, endpoint_base_dir, false) {
     std::string error;
-    module_ = VST3::Hosting::Win32Module::create(plugin_dll_path, error);
+    {
+        // NSPA: bracket the plugin module load in TIME_CRITICAL. Win32Module
+        // ultimately calls LoadLibrary on the converted path, and plugins
+        // like u-he's VST3s spawn boost::thread workers during DllMain
+        // static init that request SCHED_FIFO — without an RT-capable
+        // parent thread the kernel rejects the pthread_create and the
+        // plugin throws boost::thread_resource_error during load.
+        yabridge::nspa::ScopedTimeCriticalBoost rt_boost;
+        module_ = VST3::Hosting::Win32Module::create(
+            to_dos_path(plugin_dll_path), error);
+    }
     if (!module_) {
         throw std::runtime_error("Could not load the VST3 module for '" +
                                  plugin_dll_path + "': " + error);

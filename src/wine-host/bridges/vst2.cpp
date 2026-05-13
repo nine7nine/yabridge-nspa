@@ -163,7 +163,9 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
                        pid_t parent_pid)
     : HostBridge(main_context, plugin_dll_path, parent_pid),
       logger_(generic_logger_),
-      plugin_handle_(LoadLibrary(plugin_dll_path.c_str()), FreeLibrary),
+      plugin_handle_(yabridge::nspa::load_library_rt(
+                         to_dos_path(plugin_dll_path).c_str()),
+                     FreeLibrary),
       sockets_(main_context.context_, endpoint_base_dir, false) {
     if (!plugin_handle_) {
         throw std::runtime_error("Could not load the Windows .dll file at '" +

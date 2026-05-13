@@ -16,8 +16,6 @@
 
 #include "clap.h"
 
-#include <codecvt>
-#include <locale>
 #include <optional>
 
 #include <clap/factory/plugin-factory.h>
@@ -100,7 +98,9 @@ ClapBridge::ClapBridge(MainContext& main_context,
                        pid_t parent_pid)
     : HostBridge(main_context, plugin_dll_path, parent_pid),
       logger_(generic_logger_),
-      plugin_handle_(LoadLibrary(plugin_dll_path.c_str()), FreeLibrary),
+      plugin_handle_(yabridge::nspa::load_library_rt(
+                         to_dos_path(plugin_dll_path).c_str()),
+                     FreeLibrary),
       entry_(plugin_handle_
                  ? reinterpret_cast<clap_plugin_entry_t*>(
                        GetProcAddress(plugin_handle_.get(), "clap_entry"))
@@ -126,33 +126,26 @@ ClapBridge::ClapBridge(MainContext& main_context,
             std::to_string(entry_->clap_version.revision) + ").");
     }
 
-    // CLAP plugins receive the library path in their init function. The problem
-    // is that `plugin_dll_path` is a Linux path. This should be fine as all
-    // Wine syscalls can work with both Windows and Linux style paths, but if
-    // the plugin wants to manipulate the path then this may result in
-    // unexpected behavior. Wine can convert these paths for us, but we'd get a
-    // `WCHAR*` back which we must first convert back to UTF-8.
+    // CLAP plugins receive the library path in their init function. We pass
+    // the Wine DOS path (e.g. `C:\\...`) so any plugin that manipulates the
+    // path sees a normal Windows path rather than the raw Linux path; this
+    // matches the path Wine stores for the module via the prior
+    // `to_dos_path()`-converted `LoadLibrary()`. `to_dos_path()` falls back
+    // to the unix path if no DOS equivalent exists.
+    //
+    // Bracket the call in TIME_CRITICAL for the same reason as the
+    // preceding `load_library_rt`: any threads the plugin spawns during
+    // init must come up RT-capable.
+    //
+    // This `init()` function is not optional, but if the plugin somehow does
+    // not provide it and we'll call it anyways then the error will be less
+    // than obvious.
+    assert(entry_->init);
+    const std::string init_path = to_dos_path(plugin_dll_path);
     bool init_success;
-    WCHAR* dos_plugin_dll_path(wine_get_dos_file_name(plugin_dll_path.c_str()));
-    if (dos_plugin_dll_path) {
-        static_assert(sizeof(WCHAR) == sizeof(char16_t));
-        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>
-            converter;
-        const std::string converted_plugin_path =
-            std::string(converter.to_bytes(std::u16string(
-                reinterpret_cast<char16_t*>(dos_plugin_dll_path))));
-
-        // This function is not optional, but if the plugin somehow does not
-        // provide it and we'll call it anyways then the error will be less than
-        // obvious
-        assert(entry_->init);
-        init_success = entry_->init(converted_plugin_path.c_str());
-
-        // Can't use regular `free()` or `unique_ptr` here
-        HeapFree(GetProcessHeap(), 0, dos_plugin_dll_path);
-    } else {
-        // This should never be hit, but just in case
-        init_success = entry_->init(plugin_dll_path.c_str());
+    {
+        yabridge::nspa::ScopedTimeCriticalBoost rt_boost;
+        init_success = entry_->init(init_path.c_str());
     }
 
     if (!init_success) {
