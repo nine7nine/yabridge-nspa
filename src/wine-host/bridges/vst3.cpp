@@ -2276,20 +2276,47 @@ void Vst3Bridge::unregister_object_instance(size_t instance_id) {
         sockets_.remove_audio_processor(instance_id);
     }
 
-    // Remove the instance from within the main IO context so
-    // removing it doesn't interfere with the Win32 message loop
-    // XXX: I don't think we have to wait for the object to be
-    //      deleted most of the time, but I can imagine a situation
-    //      where the plugin does a host callback triggered by a
-    //      Win32 timer in between where the above closure is being
-    //      executed and when the actual host application context on
-    //      the plugin side gets deallocated.
-    main_context_
-        .run_in_context([&, instance_id]() -> void {
+    // Remove the instance from within the main IO context so removing it
+    // doesn't interfere with the Win32 message loop.
+    //
+    // NOTE: Erasing here destroys the Vst3PluginInstance, which destroys its
+    //   `editor` member, which destroys the X11Window wrapper.  Destroying
+    //   that wrapper sends X11 DestroyNotify events for the wrapper and (via
+    //   X11's destroy cascade) any descendant windows the plugin has parented
+    //   into it.  Wine's x11drv processes those DestroyNotify events on its
+    //   own schedule — which may be AFTER the plugin's PE-side FUnknown
+    //   destructors (just torn down via this same RPC handler) have released
+    //   their mirror of that X11 state.  When wine PE-side then accesses the
+    //   stale state, an EXCEPTION_ACCESS_VIOLATION fires inside Wine code.
+    //   That AV is caught by `unwind_exception_handler`, which returns
+    //   ExceptionCollidedUnwind — and Wine's `call_seh_handlers` dispatcher
+    //   re-calls the same handler with the same (now-stale) dispatch fields
+    //   indefinitely (latent upstream shape), exhausting the 1 MB worker
+    //   stack and wedging the thread.  Carla then waits forever for our
+    //   process to exit, hanging Carla's own quit.
+    //
+    // Observed under u-he VST3 plugins (ACE, Zebra2) when more than one
+    // instance is loaded: the second instance's teardown hits the race
+    // because the first's already touched shared wineserver/X11 state.
+    //
+    // Fix: defer the erase via an asio timer instead of running it
+    // synchronously here.  Same shape of fix as the Removed-handler fix:
+    // hold yabridge-side state alive long enough for the plugin's PE-side
+    // destruction (and any X11 events it queues) to fully settle before we
+    // tear down our wrapper.  Carla has already finished with this instance
+    // by the time Destruct fires, so the deferred actual-erase has no
+    // functional effect on Carla.
+    auto erase_timer =
+        std::make_shared<asio::steady_timer>(main_context_.context_);
+    erase_timer->expires_after(std::chrono::seconds(2));
+    erase_timer->async_wait(
+        [this, erase_timer, instance_id](const std::error_code& ec) noexcept {
+            if (ec) {
+                return;
+            }
             std::unique_lock lock(object_instances_mutex_);
             object_instances_.erase(instance_id);
-        })
-        .wait();
+        });
 }
 
 Steinberg::FUnknownPtr<Steinberg::IPluginBase> hack_init_plugin_base(
