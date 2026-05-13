@@ -169,6 +169,30 @@ struct AudioControlShutdown : public std::exception {
 // the call site falls back to socket transport for that callback.
 constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 
+// Layout version for the L2 region's direct-struct envelope extension.
+// Bumped any time the on-shmem envelope layout changes between yabridge
+// builds, so peer + creator from different builds can detect mismatch on
+// attach and fall back to the bitsery+shmem path transparently.
+//
+// Version 1 = bitsery payload only (no direct-struct extension active).
+// Future commits add per-format direct-struct envelopes (ProcessContext
+// for VST3, VstTimeInfo for VST2, clap_event_transport_t for CLAP) and
+// bump this constant on each layout change.
+constexpr uint32_t audio_control_layout_version = 1;
+
+// Environment variable that opts INTO the direct-struct envelope path.
+// Default off — incremental rollout gate. Will be flipped to default-on
+// opt-out after measurement validates the gain on representative
+// workloads, then the gate is removed once the path is stable.
+constexpr char direct_envelope_env_var[] = "YABRIDGE_DIRECT_ENVELOPE";
+
+// Returns true if YABRIDGE_DIRECT_ENVELOPE=1 in the process environment.
+// Cached on first call — subsequent calls do not touch the environment,
+// so this is safe to call from RT contexts after process startup. The
+// initial call is NOT RT-safe (it does getenv), so call sites should
+// trigger it before the audio thread starts.
+bool direct_envelope_enabled() noexcept;
+
 // Header layout — sits at offset 0 of the shmem region. Two cache-line-
 // aligned synchronization PAIRS (one per direction), then state +
 // metadata on a separate line, then the fixed-size request/reply

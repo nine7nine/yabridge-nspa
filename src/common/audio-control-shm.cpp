@@ -17,10 +17,26 @@
 #include "audio-control-shm.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
 namespace yabridge::nspa {
+
+// Direct-struct envelope rollout gate.  Returns the cached result of
+// reading YABRIDGE_DIRECT_ENVELOPE at process startup.  See header for
+// rollout policy.  Subsequent calls return without touching the
+// environment, so the function is RT-safe after first invocation —
+// call sites should trigger the initial getenv before the audio thread
+// starts (typical pattern: read once during AudioControlShm construction).
+bool direct_envelope_enabled() noexcept {
+    static const bool enabled = [] {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        const char* val = std::getenv(direct_envelope_env_var);
+        return val != nullptr && val[0] == '1' && val[1] == '\0';
+    }();
+    return enabled;
+}
 
 namespace {
 // Helper to destroy a partially-constructed Layout on init failure.
