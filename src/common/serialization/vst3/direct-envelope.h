@@ -33,11 +33,14 @@
 //     bitsery path is preserved as fallback.
 
 #include <pluginterfaces/vst/ivstevents.h>
+#include <pluginterfaces/vst/ivstparameterchanges.h>
 #include <pluginterfaces/vst/ivstprocesscontext.h>
 
 #include "../../audio-control-shm.h"
 #include "../../utils.h"
 #include "event-list.h"
+#include "param-value-queue.h"
+#include "parameter-changes.h"
 
 namespace yabridge::nspa {
 
@@ -95,8 +98,53 @@ inline void process_context_from_direct(
 }
 
 // Flag bit definitions for Vst3ProcessEnvelope::flags.
-inline constexpr uint32_t vst3_envelope_flag_process_context_valid = 1u << 0;
-inline constexpr uint32_t vst3_envelope_flag_input_events_valid    = 1u << 1;
+inline constexpr uint32_t vst3_envelope_flag_process_context_valid    = 1u << 0;
+inline constexpr uint32_t vst3_envelope_flag_input_events_valid       = 1u << 1;
+inline constexpr uint32_t vst3_envelope_flag_input_param_changes_valid = 1u << 2;
+
+// Producer-side conversion of a single YaParamValueQueue to the direct
+// envelope slot.  Returns true if the queue's point count fits within
+// max_param_points_per_queue and was written; false otherwise — the
+// caller then aborts the envelope path for the entire block-level
+// input_parameter_changes_ and leaves it on the bitsery path.
+inline bool param_queue_to_direct(const YaParamValueQueue& src,
+                                  ProcessParamQueueDirect& dst) noexcept {
+    const auto& points = src.queue_ref();
+    if (points.size() > max_param_points_per_queue) {
+        return false;
+    }
+    dst.parameter_id = src.parameter_id_;
+    dst.point_count  = static_cast<uint32_t>(points.size());
+    dst._hdr_pad[0]  = 0;
+    dst._hdr_pad[1]  = 0;
+    for (size_t i = 0; i < points.size(); i++) {
+        dst.points[i].sample_offset = points[i].first;
+        dst.points[i]._pad          = 0;
+        dst.points[i].value         = points[i].second;
+    }
+    return true;
+}
+
+// Consumer-side conversion of a direct envelope queue slot into the
+// caller-allocated YaParamValueQueue.  Caller is responsible for
+// allocating the queue in YaParameterChanges via addParameterData()
+// first (which sets parameter_id and clears the points vector); this
+// function appends points via the standard addPoint() API.  Returns
+// true on success, false if point_count exceeds the envelope cap
+// (defensive — should never trip given version-match on attach).
+inline bool param_queue_from_direct(const ProcessParamQueueDirect& src,
+                                    Steinberg::Vst::IParamValueQueue&
+                                        dst) noexcept {
+    if (src.point_count > max_param_points_per_queue) {
+        return false;
+    }
+    int32 ignored_index = 0;
+    for (uint32_t i = 0; i < src.point_count; i++) {
+        dst.addPoint(src.points[i].sample_offset,
+                     src.points[i].value, ignored_index);
+    }
+    return true;
+}
 
 // Producer-side conversion of a single YaEvent to the direct-struct
 // envelope slot.  Returns true if the event was a fixed-shape variant

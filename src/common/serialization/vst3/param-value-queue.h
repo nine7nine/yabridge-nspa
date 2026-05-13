@@ -87,6 +87,14 @@ class alignas(16) YaParamValueQueue : public Steinberg::Vst::IParamValueQueue {
      */
     Steinberg::Vst::ParamID parameter_id_;
 
+    // L2 direct-struct envelope path support.  Read-only accessor for
+    // the points vector, used by the VST3 plugin-proxy producer to
+    // copy (sample_offset, value) pairs into the envelope.
+    const llvm::SmallVector<std::pair<int32, Steinberg::Vst::ParamValue>, 16>&
+    queue_ref() const noexcept {
+        return queue_;
+    }
+
    private:
     /**
      * The actual parameter changes queue. The specification doesn't mention

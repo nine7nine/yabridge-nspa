@@ -298,6 +298,11 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
         //        (DataEvent / NoteExpressionText / Chord / Scale) or
         //        the count exceeds max_events_per_envelope, the entire
         //        list stays on the bitsery path for that block.
+        //   P4 — input_parameter_changes_ (queues vector swapped out,
+        //        leaving the YaParameterChanges with 0 queues).
+        //        Block-level fallback: queue count > 32 OR any queue's
+        //        point count > 64 keeps the whole parameter set on the
+        //        bitsery path.
         //
         // Saves into *_for_fallback so the socket fallback paths (rare
         // bitsery-size overflow AND rare L2 mid-call transport error)
@@ -312,12 +317,15 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
         // making these envelope writes visible.  No explicit fence.
         std::optional<Steinberg::Vst::ProcessContext> ctx_for_fallback;
         llvm::SmallVector<YaEvent, 64> events_for_fallback;
+        llvm::SmallVector<YaParamValueQueue, 16> params_for_fallback;
         bool envelope_publishes_context = false;
         bool envelope_publishes_events  = false;
+        bool envelope_publishes_params  = false;
         if (audio_control_shm_->envelope_active()) {
             auto& env = audio_control_shm_->layout().request_envelope_vst3;
             uint32_t envelope_flags = 0;
             uint32_t envelope_event_count = 0;
+            uint32_t envelope_queue_count = 0;
 
             // P2: ProcessContext
             if (process_request_.data.process_context_.has_value()) {
@@ -357,7 +365,33 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
                 }
             }
 
+            // P4: input_parameter_changes_ (always present, not optional)
+            {
+                auto& changes = process_request_.data.input_parameter_changes_;
+                const auto& queues = changes.queues_ref();
+                if (queues.size() <=
+                    yabridge::nspa::max_param_queues_per_envelope) {
+                    bool all_fit = true;
+                    for (size_t i = 0; i < queues.size(); i++) {
+                        if (!yabridge::nspa::param_queue_to_direct(
+                                queues[i], env.param_queues[i])) {
+                            all_fit = false;
+                            break;
+                        }
+                    }
+                    if (all_fit) {
+                        envelope_queue_count =
+                            static_cast<uint32_t>(queues.size());
+                        envelope_flags |= yabridge::nspa::
+                            vst3_envelope_flag_input_param_changes_valid;
+                        changes.swap_queues(params_for_fallback);
+                        envelope_publishes_params = true;
+                    }
+                }
+            }
+
             env.event_count = envelope_event_count;
+            env.queue_count = envelope_queue_count;
             env.flags = envelope_flags;
         }
 
@@ -385,6 +419,10 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
             if (envelope_publishes_events) {
                 process_request_.data.input_events_->swap_events(
                     events_for_fallback);
+            }
+            if (envelope_publishes_params) {
+                process_request_.data.input_parameter_changes_.swap_queues(
+                    params_for_fallback);
             }
             bridge_.receive_audio_processor_message_into(
                 MessageReference<YaAudioProcessor::Process>(process_request_),
@@ -431,6 +469,10 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
                 if (envelope_publishes_events) {
                     process_request_.data.input_events_->swap_events(
                         events_for_fallback);
+                }
+                if (envelope_publishes_params) {
+                    process_request_.data.input_parameter_changes_
+                        .swap_queues(params_for_fallback);
                 }
                 bridge_.receive_audio_processor_message_into(
                     MessageReference<YaAudioProcessor::Process>(

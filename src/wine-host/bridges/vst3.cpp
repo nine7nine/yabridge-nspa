@@ -2214,6 +2214,13 @@ size_t Vst3Bridge::register_object_instance(
                                     //   P3 — input_events_ (appended
                                     //        to the already-engaged-
                                     //        but-empty optional).
+                                    //   P4 — input_parameter_changes_
+                                    //        (queues allocated via
+                                    //        addParameterData,
+                                    //        points appended via
+                                    //        addPoint — bitsery decode
+                                    //        left the changes object
+                                    //        with 0 queues).
                                     // Fallback path (envelope_active
                                     // false or flag unset) leaves the
                                     // bitsery-decoded value untouched —
@@ -2257,6 +2264,39 @@ size_t Vst3Bridge::register_object_instance(
                                                             env.events[i], y);
                                                     list.append_event(
                                                         std::move(y));
+                                                }
+                                            }
+                                        }
+                                        if (env.flags &
+                                            yabridge::nspa::
+                                                vst3_envelope_flag_input_param_changes_valid) {
+                                            const uint32_t qcount =
+                                                env.queue_count;
+                                            if (qcount <= yabridge::nspa::
+                                                    max_param_queues_per_envelope)
+                                                [[likely]] {
+                                                auto& changes = inst
+                                                    ->pi_cond_process_request
+                                                    .data
+                                                    .input_parameter_changes_;
+                                                for (uint32_t i = 0;
+                                                     i < qcount; i++) {
+                                                    int32 unused_idx = 0;
+                                                    Steinberg::Vst::
+                                                        IParamValueQueue* q =
+                                                        changes
+                                                            .addParameterData(
+                                                                env.param_queues
+                                                                    [i]
+                                                                        .parameter_id,
+                                                                unused_idx);
+                                                    if (q) [[likely]] {
+                                                        yabridge::nspa::
+                                                            param_queue_from_direct(
+                                                                env.param_queues
+                                                                    [i],
+                                                                *q);
+                                                    }
                                                 }
                                             }
                                         }

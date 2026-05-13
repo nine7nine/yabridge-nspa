@@ -81,6 +81,19 @@ class YaParameterChanges : public Steinberg::Vst::IParameterChanges {
         s.container(queues_, 1 << 16);
     }
 
+    // L2 direct-struct envelope path support — mirror of YaEventList's
+    // helpers.  Producer extracts the queues vector into a side buffer
+    // before bitsery serialization (so the bitsery encode shrinks to
+    // "0 queues"), then swaps it back on socket-fallback paths.
+    const llvm::SmallVector<YaParamValueQueue, 16>& queues_ref()
+        const noexcept {
+        return queues_;
+    }
+    void swap_queues(
+        llvm::SmallVector<YaParamValueQueue, 16>& other) noexcept {
+        queues_.swap(other);
+    }
+
    private:
     /**
      * The parameter value changes queues.

@@ -179,9 +179,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // Version 2 = VST3 request envelope with ProcessContext direct.
 // Version 3 = VST2 request envelope with VstTimeInfo direct.
 // Version 4 = CLAP request envelope with clap_event_transport_t direct.
-// Version 5 = VST3 request envelope grown with fixed-shape event ring
+// Version 5 = VST3 request envelope grown with fixed-shape event ring.
+// Version 6 = VST3 request envelope grown with parameter queue array
 //             (this commit).
-constexpr uint32_t audio_control_layout_version = 5;
+constexpr uint32_t audio_control_layout_version = 6;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -301,29 +302,83 @@ static_assert(offsetof(ProcessEventDirect, payload) == 24,
 // stress patterns without forcing the bitsery path.
 constexpr size_t max_events_per_envelope = 256;
 
+// Direct-struct mirror of one parameter automation point — a
+// (sample_offset, value) pair from Steinberg::Vst::IParamValueQueue.
+// 16 bytes, 16-byte aligned; pad keeps `value` at natural alignment
+// for double on both 32-bit and 64-bit ABIs.
+struct alignas(16) ProcessParamPointDirect {
+    int32_t  sample_offset;      // 0
+    uint32_t _pad;               // 4   align value to 8
+    double   value;              // 8
+};
+static_assert(sizeof(ProcessParamPointDirect) == 16,
+              "ProcessParamPointDirect ABI: 16-byte layout sanity check");
+static_assert(alignof(ProcessParamPointDirect) == 16,
+              "ProcessParamPointDirect ABI: 16-byte natural alignment");
+
+// Maximum number of automation points one parameter queue can carry
+// in the envelope.  64 points covers typical Ableton-style automation
+// (one envelope move per few samples), per-buffer modulation up to
+// once-every-4-samples-on-256-sample-buffers.  Per-sample modulation
+// (256 points/buf or denser) falls back to bitsery for that block.
+constexpr size_t max_param_points_per_queue = 64;
+
+// One parameter queue: header (param_id + point count) followed by
+// the fixed-cap points array.  16-byte aligned; header is 16 bytes so
+// the points[] array starts at natural alignment without compiler-
+// inserted pad.  Per-queue size: 16 + 64*16 = 1040 bytes.
+struct alignas(16) ProcessParamQueueDirect {
+    uint32_t parameter_id;       // 0    Steinberg::Vst::ParamID
+    uint32_t point_count;        // 4
+    uint32_t _hdr_pad[2];        // 8    align points[] to 16
+    ProcessParamPointDirect points[max_param_points_per_queue];
+};
+static_assert(sizeof(ProcessParamQueueDirect) == 16 +
+                  max_param_points_per_queue *
+                      sizeof(ProcessParamPointDirect),
+              "ProcessParamQueueDirect size sanity check");
+static_assert(alignof(ProcessParamQueueDirect) == 16,
+              "ProcessParamQueueDirect 16-byte natural alignment");
+
+// Maximum number of parameter queues the envelope can carry per
+// block.  Typical sessions automate 4-12 params at once; 32 leaves
+// headroom for densely-automated mixer states (per-channel volume +
+// pan + sends).
+constexpr size_t max_param_queues_per_envelope = 32;
+
 // VST3 request-direction envelope.  Carries fixed-shape per-block fields
 // that the direct-struct path replaces bitsery for.  Extends per phase:
 //   P2 — ProcessContext.
-//   P3 (this commit) — fixed-shape event ring.
-//   P4 (future) — parameter queue array.
+//   P3 — fixed-shape event ring.
+//   P4 (this commit) — parameter queue array (input_parameter_changes_).
 //
-// Layout: cacheline-aligned header (flags + event_count), then
-// cacheline-aligned payload(s).  All access happens under the L2
+// Layout: cacheline-aligned header (flags + counts), then
+// cacheline-aligned payload sections.  All access happens under the L2
 // request pi_mutex, so no atomic primitives are needed on internal
 // fields.
 struct alignas(64) Vst3ProcessEnvelope {
     // Header — first cacheline.
     //   bit 0: process_context_valid
     //   bit 1: input_events_valid (event_count entries from events[])
+    //   bit 2: input_param_changes_valid
+    //                          (queue_count entries from param_queues[])
     uint32_t flags;
     uint32_t event_count;                    // P3: count of valid events
-    uint32_t _hdr_pad[14];                   // remainder of cacheline (56B)
+    uint32_t queue_count;                    // P4: count of valid queues
+    uint32_t _hdr_pad[13];                   // remainder of cacheline (52B)
 
     // ProcessContext payload — own cacheline (offset 64).
     ProcessContextDirect process_context;    // 112 bytes (64..175)
 
     // Event ring — cacheline-aligned (compiler inserts pad 176..191).
     alignas(64) ProcessEventDirect events[max_events_per_envelope];
+
+    // Parameter queue array — 16-byte aligned, no extra cacheline pad
+    // (events[] end at offset 12480, already 16-aligned).  Producer
+    // and consumer access serially under the request pi_mutex, so
+    // false-sharing concerns inside the array don't apply.
+    alignas(16)
+        ProcessParamQueueDirect param_queues[max_param_queues_per_envelope];
 };
 static_assert(sizeof(Vst3ProcessEnvelope) % 64 == 0,
               "Vst3ProcessEnvelope must be a multiple of cacheline size");
@@ -335,6 +390,8 @@ static_assert(offsetof(Vst3ProcessEnvelope, events) % 64 == 0,
               "events array must start cacheline-aligned");
 static_assert(offsetof(Vst3ProcessEnvelope, events) == 192,
               "events array at offset 192 (cacheline after process_context)");
+static_assert(offsetof(Vst3ProcessEnvelope, param_queues) % 16 == 0,
+              "param_queues array must start 16-aligned");
 
 // Direct-struct representation of VST2's `VstTimeInfo` (vestige
 // `aeffectx.h` class).  Field-for-field mirror with explicit-width
