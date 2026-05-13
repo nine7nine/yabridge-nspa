@@ -24,6 +24,7 @@
 #include <version.h>
 
 #include "../../common/communication/vst2.h"
+#include "../../common/serialization/vst2-direct-envelope.h"
 #include "../nspa_rt.h"
 
 /**
@@ -340,7 +341,32 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
                                 process_request);
                             if (!ok) [[unlikely]] {
                                 throw std::runtime_error(
-                                    "L2 request deserialization failed");
+                                    "L2 VST2 ProcessRequest "
+                                    "deserialization failed");
+                            }
+
+                            // === NSPA L2 direct-struct envelope override
+                            //     (P2: VstTimeInfo) ===
+                            //
+                            // When envelope_active() and the envelope's
+                            // flag is set, rehydrate current_time_info
+                            // from the shmem envelope.  Producer cleared
+                            // it before bitsery to shrink the wire
+                            // format.  Fallback (envelope_active false or
+                            // flag clear) leaves the bitsery-decoded
+                            // value intact — same-as-before behavior.
+                            if (audio_control_shm_->envelope_active()) {
+                                const auto& env =
+                                    audio_control_shm_->layout()
+                                        .request_envelope_vst2;
+                                if (env.flags &
+                                    yabridge::nspa::
+                                        vst2_envelope_flag_time_info_valid) {
+                                    VstTimeInfo ti{};
+                                    yabridge::nspa::vst_time_info_from_direct(
+                                        env.time_info, ti);
+                                    process_request.current_time_info = ti;
+                                }
                             }
 
                             // Run the same handler the socket path uses.

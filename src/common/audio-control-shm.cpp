@@ -152,6 +152,8 @@ AudioControlShm::AudioControlShm(Create, const std::string& name)
     layout_->envelope_use_direct = envelope_active_ ? 1u : 0u;
     std::memset(&layout_->request_envelope_vst3, 0,
                 sizeof(layout_->request_envelope_vst3));
+    std::memset(&layout_->request_envelope_vst2, 0,
+                sizeof(layout_->request_envelope_vst2));
 }
 
 AudioControlShm::AudioControlShm(Attach, const std::string& name)

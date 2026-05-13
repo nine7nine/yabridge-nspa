@@ -176,10 +176,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 //
 // Version 1 = bitsery payload only (Commit 1 scaffold; no direct-struct
 //             extension active).
-// Version 2 = VST3 request envelope with ProcessContext direct (this
-//             commit).  VST2 + CLAP envelopes added in subsequent
-//             commits, each bumping the version.
-constexpr uint32_t audio_control_layout_version = 2;
+// Version 2 = VST3 request envelope with ProcessContext direct.
+// Version 3 = adds VST2 request envelope with VstTimeInfo direct
+//             (this commit).  CLAP envelope added next, bumping again.
+constexpr uint32_t audio_control_layout_version = 3;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -243,6 +243,53 @@ static_assert(alignof(Vst3ProcessEnvelope) == 64,
               "Vst3ProcessEnvelope cacheline-aligned");
 static_assert(offsetof(Vst3ProcessEnvelope, process_context) == 64,
               "process_context must start at offset 64 (own cacheline)");
+
+// Direct-struct representation of VST2's `VstTimeInfo` (vestige
+// `aeffectx.h` class).  Field-for-field mirror with explicit-width
+// primitives — POD safe across producer (Linux native gcc) and
+// consumer (winegcc PE side) ABIs.  88 bytes, 8-byte natural
+// alignment.  Conversion helpers in
+// `common/serialization/vst2-direct-envelope.h`.
+struct VstTimeInfoDirect {
+    double  sample_pos;             // 0
+    double  sample_rate;             // 8
+    double  nano_seconds;            // 16
+    double  ppq_pos;                 // 24
+    double  tempo;                   // 32
+    double  bar_start_pos;           // 40
+    double  cycle_start_pos;         // 48
+    double  cycle_end_pos;           // 56
+    int32_t time_sig_numerator;      // 64
+    int32_t time_sig_denominator;    // 68
+    uint8_t empty3[12];              // 72  mirrors vestige VstTimeInfo::empty3
+    int32_t flags;                   // 84
+};
+static_assert(sizeof(VstTimeInfoDirect) == 88,
+              "VstTimeInfoDirect ABI: 88-byte layout sanity check");
+static_assert(alignof(VstTimeInfoDirect) == 8,
+              "VstTimeInfoDirect ABI: 8-byte natural alignment");
+
+// VST2 request-direction envelope.  Carries the fixed-shape per-block
+// fields that the direct-struct path replaces bitsery for.  P2 (this
+// commit) covers VstTimeInfo only — the rest of the small
+// `Vst2ProcessRequest` (sample_frames + double_precision +
+// current_process_level, ~9 bytes total) stays on the bitsery path
+// since the encoding cost is already memcpy-equivalent at that size.
+struct alignas(64) Vst2ProcessEnvelope {
+    // Header — first cacheline.  bit 0: time_info_valid.
+    uint32_t flags;
+    uint32_t _hdr_pad[15];           // remainder of cacheline
+
+    // VstTimeInfo payload — starts at offset 64 (next cacheline).
+    VstTimeInfoDirect time_info;     // 88 bytes
+    // trailing pad to next 64-byte boundary handled by struct alignas
+};
+static_assert(sizeof(Vst2ProcessEnvelope) % 64 == 0,
+              "Vst2ProcessEnvelope must be a multiple of cacheline size");
+static_assert(alignof(Vst2ProcessEnvelope) == 64,
+              "Vst2ProcessEnvelope cacheline-aligned");
+static_assert(offsetof(Vst2ProcessEnvelope, time_info) == 64,
+              "time_info must start at offset 64 (own cacheline)");
 
 // Environment variable that opts INTO the direct-struct envelope path.
 // Default off — incremental rollout gate. Will be flipped to default-on
@@ -309,17 +356,17 @@ struct AudioControlShmLayout {
 
     // Per-format request envelope sections.  Only the section for this
     // instance's plugin format is populated; others stay zeroed.
-    // Sections appended per format in their commits — VST3 first
-    // (this commit), VST2 + CLAP follow.
     alignas(64) Vst3ProcessEnvelope request_envelope_vst3;
+    alignas(64) Vst2ProcessEnvelope request_envelope_vst2;
 };
 
 static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
               "req_lock must be at offset 0 for ABI stability");
 static_assert(sizeof(AudioControlShmLayout) >=
                   (2 * audio_control_buf_size + 320 + 64 +
-                   sizeof(Vst3ProcessEnvelope)),
-              "layout sanity check (with VST3 envelope extension)");
+                   sizeof(Vst3ProcessEnvelope) +
+                   sizeof(Vst2ProcessEnvelope)),
+              "layout sanity check (with VST3 + VST2 envelope extensions)");
 
 // RAII handle to an AudioControlShm region. Holds the shm_open fd and
 // the mmap pointer. Constructor mode controls whether we create

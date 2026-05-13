@@ -17,6 +17,7 @@
 #include "vst2.h"
 
 #include "../../common/communication/vst2.h"
+#include "../../common/serialization/vst2-direct-envelope.h"
 #include "../utils.h"
 
 intptr_t dispatch_proxy(AEffect*, int, int, intptr_t, void*, float);
@@ -729,6 +730,36 @@ void Vst2PluginBridge::do_process(T** inputs, T** outputs, int sample_frames) {
         // memcpys the reply back. The wine-host audio worker runs at PI-
         // boosted priority for the duration of the callback.
         //
+        // === NSPA L2 direct-struct envelope write (P2: VstTimeInfo) ===
+        //
+        // When envelope_active(), publish VstTimeInfo directly into the
+        // shmem envelope and clear request.current_time_info so the
+        // subsequent quickSerialization encodes a 1-byte "absent"
+        // optional tag instead of the full ~88-byte serialized struct.
+        // Saved into time_info_for_fallback for the rare over-budget
+        // socket path which must carry the time info via bitsery.
+        //
+        // Writes happen-before the release-store of state inside the
+        // request pi_mutex (audio_control_send_and_wait), and are
+        // visible to the consumer via the matching acquire-load.
+        std::optional<VstTimeInfo> time_info_for_fallback;
+        const bool envelope_publishes_time_info =
+            audio_control_shm_->envelope_active() &&
+            request.current_time_info.has_value();
+        if (envelope_publishes_time_info) {
+            auto& env = audio_control_shm_->layout().request_envelope_vst2;
+            yabridge::nspa::vst_time_info_to_direct(
+                *request.current_time_info, env.time_info);
+            env.flags =
+                yabridge::nspa::vst2_envelope_flag_time_info_valid;
+            time_info_for_fallback = std::move(request.current_time_info);
+            request.current_time_info.reset();
+        } else if (audio_control_shm_->envelope_active()) {
+            // Envelope active but host didn't provide time info for this
+            // block.  Clear the flag.
+            audio_control_shm_->layout().request_envelope_vst2.flags = 0;
+        }
+
         // quickSerialization writes into pi_cond_req_buf_ (resizes within
         // the inline 64 KiB; no heap). Returns the size written.
         const size_t req_size = bitsery::quickSerialization<
@@ -756,7 +787,13 @@ void Vst2PluginBridge::do_process(T** inputs, T** outputs, int sample_frames) {
         } catch (const std::overflow_error&) {
             // Payload exceeded 64 KiB shmem slot — fall back to socket
             // for this one callback. Shouldn't happen for VST2 process
-            // requests in practice, but defensive.
+            // requests in practice, but defensive.  Socket path doesn't
+            // read the envelope, so restore current_time_info before
+            // sending if it was cleared for the L2 attempt.
+            if (envelope_publishes_time_info) {
+                request.current_time_info =
+                    std::move(time_info_for_fallback);
+            }
             sockets_.host_plugin_process_replacing_.send(request);
             sockets_.host_plugin_process_replacing_.receive_single<Ack>();
         } catch (const yabridge::nspa::AudioControlShutdown&) {
@@ -764,6 +801,10 @@ void Vst2PluginBridge::do_process(T** inputs, T** outputs, int sample_frames) {
             // process is going away. Fall back so this final callback
             // (if any) still completes; the socket may also be closing
             // but that fails gracefully at the SocketHandler level.
+            if (envelope_publishes_time_info) {
+                request.current_time_info =
+                    std::move(time_info_for_fallback);
+            }
             sockets_.host_plugin_process_replacing_.send(request);
             sockets_.host_plugin_process_replacing_.receive_single<Ack>();
         }
