@@ -264,16 +264,6 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
     assert(plugin && plugin->plugin_data && process);
     auto self = static_cast<clap_plugin_proxy*>(plugin->plugin_data);
 
-    // We'll synchronize the scheduling priority of the audio thread on the Wine
-    // plugin host with that of the host's audio thread every once in a while
-    std::optional<int> new_realtime_priority = std::nullopt;
-    time_t now = time(nullptr);
-    if (now > self->last_audio_thread_priority_synchronization_ +
-                  audio_thread_priority_synchronization_interval) {
-        new_realtime_priority = get_realtime_priority();
-        self->last_audio_thread_priority_synchronization_ = now;
-    }
-
     // We reuse this existing object to avoid allocations.
     // `clap::process::Process::repopulate()` will write the input audio to the
     // shared audio buffers, so they're not stored within the request object
@@ -282,7 +272,6 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
     self->process_request_.instance_id = self->instance_id();
     self->process_request_.process.repopulate(*process,
                                               *self->process_buffers_);
-    self->process_request_.new_realtime_priority = new_realtime_priority;
 
     // HACK: This is a bit ugly. This `clap::process::Process::Response` object
     //       actually contains pointers to the corresponding `YaProcessData`

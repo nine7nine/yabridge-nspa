@@ -651,17 +651,6 @@ void Vst2PluginBridge::do_process(T** inputs, T** outputs, int sample_frames) {
     request.current_process_level = static_cast<int>(host_callback_function_(
         &plugin_, audioMasterGetCurrentProcessLevel, 0, 0, nullptr, 0.0));
 
-    // We'll synchronize the scheduling priority of the audio thread on the Wine
-    // plugin host with that of the host's audio thread every once in a while
-    const time_t now = time(nullptr);
-    if (now > last_audio_thread_priority_synchronization_ +
-                  audio_thread_priority_synchronization_interval) {
-        request.new_realtime_priority = get_realtime_priority();
-        last_audio_thread_priority_synchronization_ = now;
-    } else {
-        request.new_realtime_priority.reset();
-    }
-
     // We reuse this audio buffers object both for the request and the response
     // to avoid unnecessary allocations. The inputs and outputs arrays should be
     // `[num_inputs][sample_frames]` and `[num_outputs][sample_frames]` floats

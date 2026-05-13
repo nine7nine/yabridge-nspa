@@ -212,23 +212,12 @@ tresult PLUGIN_API Vst3PluginProxyImpl::setProcessing(TBool state) {
 
 tresult PLUGIN_API
 Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
-    // We'll synchronize the scheduling priority of the audio thread on the Wine
-    // plugin host with that of the host's audio thread every once in a while
-    std::optional<int> new_realtime_priority = std::nullopt;
-    time_t now = time(nullptr);
-    if (now > last_audio_thread_priority_synchronization_ +
-                  audio_thread_priority_synchronization_interval) {
-        new_realtime_priority = get_realtime_priority();
-        last_audio_thread_priority_synchronization_ = now;
-    }
-
     // We reuse this existing object to avoid allocations.
     // `YaProcessData::repopulate()` will write the input audio to the shared
     // audio buffers, so they're not stored within the request object itself.
     assert(process_buffers_);
     process_request_.instance_id = instance_id();
     process_request_.data.repopulate(data, *process_buffers_);
-    process_request_.new_realtime_priority = new_realtime_priority;
 
     // HACK: This is a bit ugly. This `YaProcessData::Response` object actually
     //       contains pointers to the corresponding `YaProcessData` fields in

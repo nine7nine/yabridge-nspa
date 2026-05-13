@@ -292,14 +292,6 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
             decltype(process_level_cache_)::Guard process_level_cache_guard =
                 process_level_cache_.set(process_request.current_process_level);
 
-            // As suggested by Jack Winter, we'll synchronize this thread's
-            // audio processing priority with that of the host's audio
-            // thread every once in a while
-            if (process_request.new_realtime_priority) {
-                set_realtime_priority(true,
-                                      *process_request.new_realtime_priority);
-            }
-
             // Let the plugin process the MIDI events that were received
             // since the last buffer, and then clean up those events. This
             // approach should not be needed but Kontakt only stores

@@ -319,13 +319,6 @@ class clap_plugin_proxy {
     clap::plugin::Descriptor descriptor_;
 
     /**
-     * We'll periodically synchronize the Wine host's audio thread priority with
-     * that of the host. Since the overhead from doing so does add up, we'll
-     * only do this every once in a while.
-     */
-    time_t last_audio_thread_priority_synchronization_ = 0;
-
-    /**
      * A shared memory object to share audio buffers between the native plugin
      * and the Wine plugin host. Copying audio is the most significant source of
      * bridging overhead during audio processing, and this way we can reduce the

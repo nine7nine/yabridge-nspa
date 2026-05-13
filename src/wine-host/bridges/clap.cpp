@@ -1114,14 +1114,6 @@ void ClapBridge::register_plugin_instance(
                     //       `bitsery::ext::MessageReference`)
                     clap::plugin::Process& request = request_ref.get();
 
-                    // As suggested by Jack Winter, we'll synchronize this
-                    // thread's audio processing priority with that of the
-                    // host's audio thread every once in a while
-                    if (request.new_realtime_priority) {
-                        set_realtime_priority(true,
-                                              *request.new_realtime_priority);
-                    }
-
                     const auto& [instance, _] =
                         get_instance(request.instance_id);
 
