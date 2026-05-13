@@ -383,3 +383,9 @@ if with_bitbridge
     link_args : ['-m32'],
   )
 endif
+
+# Cross-build install hook.  Meson refuses `install : true` on `native : true`
+# targets in a cross build (treats them as build-machine tooling), so we wrap
+# install in a script that copies build outputs to /usr/{bin,lib}.  Runs on
+# `ninja install`; honours $DESTDIR for staged installs (e.g. PKGBUILD).
+meson.add_install_script('tools/install-yabridge.sh')
