@@ -354,6 +354,21 @@ const void* ClapPluginBridge::get_factory(const char* factory_id) {
     }
 }
 
+// L2 — derive the same deterministic shm name the wine-host bridge
+// computes in ClapBridge::nspa_audio_control_shm_name. sockets_.base_dir_
+// is identical on both sides.
+std::string ClapPluginBridge::nspa_audio_control_shm_name(
+    size_t instance_id) const {
+    std::string token = sockets_.base_dir_.filename().string();
+    for (char& c : token) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+              c == '-' || c == '_' || c == '.')) {
+            c = '_';
+        }
+    }
+    return "/" + token + "-clap-" + std::to_string(instance_id) + ".audio_ctl";
+}
+
 std::pair<clap_plugin_proxy&, std::shared_lock<std::shared_mutex>>
 ClapPluginBridge::get_proxy(size_t instance_id) noexcept {
     std::shared_lock lock(plugin_proxies_mutex_);

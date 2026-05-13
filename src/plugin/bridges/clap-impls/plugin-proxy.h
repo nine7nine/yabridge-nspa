@@ -17,6 +17,7 @@
 #pragma once
 
 #include <future>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -36,6 +37,8 @@
 #include <rigtorp/MPMCQueue.h>
 #include <function2/function2.hpp>
 
+#include "../../common/audio-control-shm.h"
+#include "../../common/communication/common.h"  // SerializationBuffer<N>
 #include "../../common/serialization/clap/ext/params.h"
 #include "../../common/serialization/clap/plugin.h"
 
@@ -351,6 +354,18 @@ class clap_plugin_proxy {
      * deserialized in place.
      */
     clap::plugin::ProcessResponse process_response_;
+
+    // L2 — per-instance pi_cond audio rendezvous attached during this
+    // proxy's constructor (wine-host created it during
+    // register_plugin_instance before audio_thread_handler started
+    // listening, so by the time we attach the region exists). Same
+    // shape as Vst3PluginProxyImpl. Fallback to the socket transport
+    // on any attach failure; plugin_process dispatches on the optional.
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_buf_;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_buf_;
 
     /**
      * The vtable for `clap_plugin`, requires that this object is never moved or

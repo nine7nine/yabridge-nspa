@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 
@@ -25,8 +27,10 @@
 #include <clap/factory/plugin-factory.h>
 #include <clap/plugin.h>
 
+#include "../../common/audio-control-shm.h"
 #include "../../common/audio-shm.h"
 #include "../../common/communication/clap.h"
+#include "../../common/communication/common.h"  // for SerializationBuffer<N>
 #include "../../common/configuration.h"
 #include "../../common/mutual-recursion.h"
 #include "../editor.h"
@@ -97,8 +101,30 @@ struct ClapPluginInstance {
      */
     ClapPluginInstance(const clap_plugin* plugin,
                        std::unique_ptr<clap_host_proxy> host_proxy) noexcept;
+    ~ClapPluginInstance() noexcept;
 
    public:
+    // L2 — pi_cond audio rendezvous for clap_plugin::process. Declared
+    // FIRST in the struct so it destructs LAST (after both Win32Thread
+    // members join). Same shape as Vst3PluginInstance — see that file
+    // for the lifecycle reasoning. Wine-host creates with a deterministic
+    // name during register_plugin_instance; plugin-lib attaches by the
+    // same name once it has the instance_id. The existing
+    // audio_thread_handler keeps the socket path for non-Process
+    // messages (StartProcessing, StopProcessing, Reset, params::Flush,
+    // tail::Get, etc.); audio_process_handler is dedicated to Process.
+    std::optional<yabridge::nspa::AudioControlShm> audio_control_shm;
+    std::atomic<bool> audio_loop_stop{false};
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_req_local;
+    SerializationBuffer<yabridge::nspa::audio_control_buf_size>
+        pi_cond_reply_local;
+    clap::plugin::Process pi_cond_process_request;
+    clap::plugin::ProcessResponse pi_cond_process_response;
+    // Declared AFTER audio_control_shm (destructs BEFORE shmem) so the
+    // thread joins while the shmem is still mapped.
+    Win32Thread audio_process_handler;
+
     /**
      * A proxy for the native CLAP host. Stored using an `std::unique_ptr`
      * because it must be created before creating the plugin instance, and the
@@ -375,6 +401,18 @@ class ClapBridge : public HostBridge {
      * instance's audio thread.
      */
     void unregister_plugin_instance(size_t instance_id);
+
+    // Run a clap_plugin::process call on the wine-host side. Extracted
+    // from the audio_thread_handler overload so the socket + L2 pi_cond
+    // paths share one body — same shape as Vst3Bridge::handle_process.
+    clap::plugin::ProcessResponse handle_process(
+        clap::plugin::Process& request);
+
+    // L2 — deterministic POSIX shm name for the per-instance pi_cond
+    // audio rendezvous region. Derived from sockets_.base_dir_ (identical
+    // on both sides) and instance_id. Same naming scheme as VST3 with
+    // "-clap-" infix instead of "-vst3-".
+    std::string nspa_audio_control_shm_name(size_t instance_id) const;
 
     /**
      * The shared library handle of the CLAP plugin.

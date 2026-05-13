@@ -60,6 +60,32 @@ clap::host::SupportedHostExtensions ClapHostExtensions::supported()
         .supports_voice_info = voice_info != nullptr};
 }
 
+// L2 — attempt to attach the per-instance pi_cond audio rendezvous
+// region the wine-host bridge created during register_plugin_instance.
+// Wine-host's register_plugin_instance creates the region BEFORE
+// add_audio_thread_and_listen_control completes, and plugin-lib's
+// proxy is constructed after the Create response on the control
+// socket — so by the time this initializer runs the region exists.
+// On any attach failure (mmap, perms, stale region from a crashed
+// wine-host predecessor) leave nullopt and plugin_process falls back
+// to the audio socket path.
+static std::optional<yabridge::nspa::AudioControlShm>
+clap_proxy_attach_audio_control(ClapPluginBridge& bridge, size_t instance_id) {
+    const std::string shm_name =
+        bridge.nspa_audio_control_shm_name(instance_id);
+    try {
+        return std::optional<yabridge::nspa::AudioControlShm>(
+            std::in_place, yabridge::nspa::AudioControlShm::Attach{}, shm_name);
+    } catch (const std::exception& e) {
+        bridge.logger_.log(
+            std::string("L2 CLAP pi_cond audio rendezvous attach failed "
+                        "(name='") +
+            shm_name + "'): " + e.what() +
+            " — falling back to socket transport for this instance.");
+        return std::nullopt;
+    }
+}
+
 clap_plugin_proxy::clap_plugin_proxy(ClapPluginBridge& bridge,
                                      size_t instance_id,
                                      clap::plugin::Descriptor descriptor,
@@ -68,6 +94,10 @@ clap_plugin_proxy::clap_plugin_proxy(ClapPluginBridge& bridge,
       bridge_(bridge),
       instance_id_(instance_id),
       descriptor_(std::move(descriptor)),
+      // L2 — declared BEFORE plugin_vtable_ in the class, so initialize
+      // here to match field order (avoids -Wreorder-ctor).
+      audio_control_shm_(
+          clap_proxy_attach_audio_control(bridge, instance_id)),
       plugin_vtable_(clap_plugin_t{
           .desc = descriptor_.get(),
           .plugin_data = this,
@@ -144,7 +174,15 @@ clap_plugin_proxy::clap_plugin_proxy(ClapPluginBridge& bridge,
       }),
       // These function objects are relatively large, and we probably won't be
       // getting that many of them
-      pending_callbacks_(128) {}
+      pending_callbacks_(128) {
+    // Pre-size pi_cond_reply_buf_. .data() must be valid for full inline
+    // capacity since the pi_cond helper memcpys into it before bitsery
+    // reads. pi_cond_req_buf_ is sized by quickSerialization on the
+    // request side (resizes within the inline 64 KiB).
+    if (audio_control_shm_) {
+        pi_cond_reply_buf_.resize(yabridge::nspa::audio_control_buf_size);
+    }
+}
 
 void clap_plugin_proxy::clear_param_info_cache() {
     std::lock_guard lock(param_info_cache_mutex_);
@@ -289,11 +327,52 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
     self->process_response_.output_data =
         self->process_request_.process.create_response();
 
-    // We'll also receive the response into an existing object so we can also
-    // avoid heap allocations there
-    self->bridge_.receive_audio_thread_message_into(
-        MessageReference<clap::plugin::Process>(self->process_request_),
-        self->process_response_);
+    if (self->audio_control_shm_) [[likely]] {
+        // L2 — pi_cond audio round-trip with cross-process PI. Same
+        // shape as the VST3 proxy. Process metadata is bounded at
+        // audio_control_buf_size; the audio buffers themselves live in
+        // process_buffers_ (AudioShmBuffer).
+        const size_t request_size =
+            bitsery::quickSerialization<OutputAdapter<SerializationBufferBase>>(
+                self->pi_cond_req_buf_, self->process_request_);
+        bool ok_dispatch = false;
+        if (request_size <= yabridge::nspa::audio_control_buf_size) {
+            size_t reply_size = 0;
+            try {
+                yabridge::nspa::audio_control_send_and_wait(
+                    *self->audio_control_shm_,
+                    self->pi_cond_req_buf_.data(), request_size,
+                    self->pi_cond_reply_buf_.data(),
+                    yabridge::nspa::audio_control_buf_size, reply_size);
+
+                auto [_, deser_ok] = bitsery::quickDeserialization<
+                    InputAdapter<SerializationBufferBase>>(
+                    {self->pi_cond_reply_buf_.begin(), reply_size},
+                    self->process_response_);
+                if (!deser_ok) [[unlikely]] {
+                    throw std::runtime_error(
+                        "L2 CLAP ProcessResponse deserialization failed");
+                }
+                ok_dispatch = true;
+            } catch (const std::exception& e) {
+                self->bridge_.logger_.log(
+                    std::string(
+                        "L2 CLAP pi_cond audio transport error, dropping to "
+                        "socket transport for this call: ") +
+                    e.what());
+            }
+        }
+        if (!ok_dispatch) {
+            self->bridge_.receive_audio_thread_message_into(
+                MessageReference<clap::plugin::Process>(self->process_request_),
+                self->process_response_);
+        }
+    } else {
+        // Socket fallback — same as upstream.
+        self->bridge_.receive_audio_thread_message_into(
+            MessageReference<clap::plugin::Process>(self->process_request_),
+            self->process_response_);
+    }
 
     // At this point the shared audio buffers should contain the output audio,
     // so we'll write that back to the host along with any metadata (which in

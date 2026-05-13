@@ -218,6 +218,16 @@ class ClapPluginBridge : PluginBridge<ClapSockets<std::jthread>> {
         return plugin.run_on_main_thread(std::forward<F>(fn));
     }
 
+    // L2 — deterministic POSIX shm name for the per-instance pi_cond
+    // audio rendezvous region. Mirrors ClapBridge::nspa_audio_control_shm_name
+    // on the wine-host side. Both sides derive the same name from
+    // sockets_.base_dir_ (identical on both sides) and instance_id.
+    // Wine-host CREATES this region during register_plugin_instance,
+    // BEFORE either side of the socket exchanges further messages — so
+    // by the time clap_plugin_proxy is constructed on plugin-lib and
+    // calls this helper to attach, the region is already initialized.
+    std::string nspa_audio_control_shm_name(size_t instance_id) const;
+
     /**
      * The logging facility used for this instance of yabridge. Wraps around
      * `PluginBridge::generic_logger`.

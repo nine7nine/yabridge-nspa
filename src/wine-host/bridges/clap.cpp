@@ -82,6 +82,17 @@ ClapPluginInstance::ClapPluginInstance(
       // plugin
       extensions() {}
 
+// L2 — signal shutdown so audio_process_handler exits pi_cond_wait
+// before the implicit member destruction reaches its Win32Thread join.
+// See Vst3PluginInstance::~Vst3PluginInstance for the lifecycle reasoning.
+// Idempotent with unregister_plugin_instance's signal_shutdown call.
+ClapPluginInstance::~ClapPluginInstance() noexcept {
+    audio_loop_stop.store(true, std::memory_order_release);
+    if (audio_control_shm) {
+        audio_control_shm->signal_shutdown();
+    }
+}
+
 ClapBridge::ClapBridge(MainContext& main_context,
                        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                        std::string plugin_dll_path,
@@ -1047,6 +1058,54 @@ std::optional<AudioShmBuffer::Config> ClapBridge::setup_shared_audio_buffers(
     return buffer_config;
 }
 
+std::string ClapBridge::nspa_audio_control_shm_name(size_t instance_id) const {
+    std::string token = sockets_.base_dir_.filename().string();
+    for (char& c : token) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+              c == '-' || c == '_' || c == '.')) {
+            c = '_';
+        }
+    }
+    return "/" + token + "-clap-" + std::to_string(instance_id) + ".audio_ctl";
+}
+
+clap::plugin::ProcessResponse ClapBridge::handle_process(
+    clap::plugin::Process& request) {
+    const auto& [instance, _] = get_instance(request.instance_id);
+    // Most plugins will already enable FTZ, but there are a handful of
+    // plugins that don't that suffer from extreme DSP load increases when
+    // they start producing denormals.
+    ScopedFlushToZero ftz_guard;
+
+    // The actual audio is stored in the shared memory buffers, so the
+    // reconstruction function will need to know where it should point the
+    // `AudioBusBuffers` to
+    // HACK: The VST3 version of IK-Multimedia's T-RackS 5 will hang if
+    //       audio processing is done from the audio thread while the
+    //       plugin is in offline processing mode. So as a precaution,
+    //       we'll also do offline processing for CLAP plugins on the
+    //       GUI thread.
+    clap_process_status result;
+    auto& reconstructed = request.process.reconstruct(
+        instance.process_buffers_input_pointers,
+        instance.process_buffers_output_pointers);
+    if (instance.render_mode == CLAP_RENDER_OFFLINE) {
+        result = main_context_
+                     .run_in_context(
+                         [&instance = instance, &reconstructed]() {
+                             return instance.plugin->process(
+                                 instance.plugin.get(), &reconstructed);
+                         })
+                     .get();
+    } else {
+        result = instance.plugin->process(instance.plugin.get(),
+                                          &reconstructed);
+    }
+
+    return clap::plugin::ProcessResponse{
+        .result = result, .output_data = request.process.create_response()};
+}
+
 void ClapBridge::register_plugin_instance(
     const clap_plugin* plugin,
     std::unique_ptr<clap_host_proxy> host_proxy) {
@@ -1056,10 +1115,42 @@ void ClapBridge::register_plugin_instance(
     assert(host_proxy);
 
     // This instance ID has already been generated because the host proxy has to
-    // be created before the plugin instance
+    // be created before the plugin instance.
     const size_t instance_id = host_proxy->owner_instance_id();
-    object_instances_.emplace(
-        instance_id, ClapPluginInstance(plugin, std::move(host_proxy)));
+    // L2: try_emplace constructs ClapPluginInstance in-place from the
+    // ctor args. Upstream's emplace(id, ClapPluginInstance(...)) would
+    // require the move constructor — but our user-declared destructor
+    // suppresses the implicit move, so we'd otherwise need to either
+    // = default it (atomic blocks that) or rewrite the call site.
+    // try_emplace is the cleanest fix and identical in effect.
+    object_instances_.try_emplace(instance_id, plugin, std::move(host_proxy));
+
+    // L2 — try to create the per-instance pi_cond audio rendezvous region
+    // BEFORE spawning either audio-side Win32Thread. Wine-host is the
+    // CREATOR; plugin-lib attaches by the same deterministic name after
+    // receiving its instance_id (the synchronous create-response on the
+    // control socket gives a race-free handshake). On any creation
+    // failure (perms, /dev/shm exhaustion, stale region) leave the
+    // optional empty and fall through to the socket-only path.
+    {
+        ClapPluginInstance& inst = object_instances_.at(instance_id);
+        const std::string shm_name = nspa_audio_control_shm_name(instance_id);
+        try {
+            inst.audio_control_shm.emplace(
+                yabridge::nspa::AudioControlShm::Create{}, shm_name);
+            inst.pi_cond_req_local.resize(
+                yabridge::nspa::audio_control_buf_size);
+            inst.pi_cond_reply_local.reserve(
+                yabridge::nspa::audio_control_buf_size);
+        } catch (const std::exception& e) {
+            logger_.log(
+                std::string("L2 CLAP pi_cond audio rendezvous setup failed "
+                            "(name='") +
+                shm_name + "'): " + e.what() +
+                " — falling back to socket transport for this instance.");
+            // inst.audio_control_shm remains nullopt
+        }
+    }
 
     // Every plugin instance gets its own audio thread along with sockets for
     // host->plugin control messages and plugin->host callbacks
@@ -1112,45 +1203,14 @@ void ClapBridge::register_plugin_instance(
                     //       object, and we only store a reference to it in our
                     //       variant (this is done during the deserialization in
                     //       `bitsery::ext::MessageReference`)
-                    clap::plugin::Process& request = request_ref.get();
-
-                    const auto& [instance, _] =
-                        get_instance(request.instance_id);
-
-                    // Most plugins will already enable FTZ, but there are a
-                    // handful of plugins that don't that suffer from extreme
-                    // DSP load increases when they start producing denormals
-                    ScopedFlushToZero ftz_guard;
-
-                    // The actual audio is stored in the shared memory
-                    // buffers, so the reconstruction function will need to
-                    // know where it should point the `AudioBusBuffers` to
-                    // HACK: The VST3 version of IK-Multimedia's T-RackS 5 will
-                    //       hang if audio processing is done from the audio
-                    //       thread while the plugin is in offline processing
-                    //       mode. So as a precaution, we'll also do offline
-                    //       processing for CLAP plugins on the GUI thread.
-                    clap_process_status result;
-                    auto& reconstructed = request.process.reconstruct(
-                        instance.process_buffers_input_pointers,
-                        instance.process_buffers_output_pointers);
-                    if (instance.render_mode == CLAP_RENDER_OFFLINE) {
-                        result =
-                            main_context_
-                                .run_in_context([&instance = instance,
-                                                 &reconstructed]() {
-                                    return instance.plugin->process(
-                                        instance.plugin.get(), &reconstructed);
-                                })
-                                .get();
-                    } else {
-                        result = instance.plugin->process(instance.plugin.get(),
-                                                          &reconstructed);
-                    }
-
-                    return clap::plugin::ProcessResponse{
-                        .result = result,
-                        .output_data = request.process.create_response()};
+                    //
+                    // L2: when audio_control_shm is set on this instance,
+                    // plugin-lib routes Process through pi_cond instead of
+                    // this socket — this lambda body becomes the socket-
+                    // fallback path. Either way the dispatch semantics
+                    // are identical — relocated into handle_process so
+                    // both transports share one body.
+                    return handle_process(request_ref.get());
                 },
                 [&](clap::ext::params::plugin::Flush& request)
                     -> clap::ext::params::plugin::Flush::Response {
@@ -1179,9 +1239,110 @@ void ClapBridge::register_plugin_instance(
     // the native plugin may try to connect to it before our thread is up and
     // running.
     socket_listening_latch.get_future().wait();
+
+    // L2 — Process-only pi_cond thread (mirrors VST3). Plugin-lib chooses
+    // transport per call: pi_cond when it has attached the shmem,
+    // otherwise this thread parks waiting and Process arrives on the
+    // socket (handled by audio_thread_handler's Process lambda which
+    // also routes to handle_process). Lock discipline: thread captures
+    // only instance_id, looks up the per-instance state ONCE on entry
+    // via get_instance (briefly held shared_lock), then uses the stable
+    // pointer for the loop. unordered_map references survive past
+    // insert/emplace and are only invalidated by erase, which
+    // unregister_plugin_instance sequences AFTER signal_shutdown.
+    if (object_instances_.at(instance_id).audio_control_shm) {
+        object_instances_.at(instance_id).audio_process_handler =
+            Win32Thread([this, instance_id]() {
+                yabridge::nspa::set_thread_time_critical();
+                const std::string thread_name =
+                    "audio-pi-" + std::to_string(instance_id);
+                pthread_setname_np(pthread_self(), thread_name.c_str());
+
+                ClapPluginInstance* inst;
+                {
+                    auto [instance, lock] = get_instance(instance_id);
+                    inst = &instance;
+                }
+                // ===== shared_lock dropped; pointer remains valid =====
+
+                while (!inst->audio_loop_stop.load(
+                    std::memory_order_acquire)) {
+                    try {
+                        yabridge::nspa::audio_control_recv_one(
+                            *inst->audio_control_shm,
+                            inst->pi_cond_req_local.data(),
+                            yabridge::nspa::audio_control_buf_size,
+                            inst->pi_cond_reply_local.data(),
+                            yabridge::nspa::audio_control_buf_size,
+                            [&](const uint8_t* req_bytes, size_t req_size,
+                                uint8_t* reply_out,
+                                size_t reply_capacity) -> size_t {
+                                (void)req_bytes;
+                                auto [_, ok] = bitsery::quickDeserialization<
+                                    InputAdapter<SerializationBufferBase>>(
+                                    {inst->pi_cond_req_local.begin(),
+                                     req_size},
+                                    inst->pi_cond_process_request);
+                                if (!ok) [[unlikely]] {
+                                    throw std::runtime_error(
+                                        "L2 CLAP Process deserialization "
+                                        "failed");
+                                }
+
+                                // Same body as the socket Process lambda
+                                // (which also calls handle_process). No
+                                // cross-process lock held during plugin
+                                // processing.
+                                inst->pi_cond_process_response =
+                                    handle_process(
+                                        inst->pi_cond_process_request);
+
+                                const size_t reply_size =
+                                    bitsery::quickSerialization<
+                                        OutputAdapter<
+                                            SerializationBufferBase>>(
+                                        inst->pi_cond_reply_local,
+                                        inst->pi_cond_process_response);
+                                if (reply_size > reply_capacity)
+                                    [[unlikely]] {
+                                    throw std::overflow_error(
+                                        "L2 CLAP Process reply too large "
+                                        "for reply buffer");
+                                }
+
+                                if (inst->pi_cond_reply_local.data() !=
+                                    reply_out) {
+                                    std::memcpy(
+                                        reply_out,
+                                        inst->pi_cond_reply_local.data(),
+                                        reply_size);
+                                }
+                                return reply_size;
+                            });
+                    } catch (const yabridge::nspa::AudioControlShutdown&) {
+                        break;
+                    }
+                }
+            });
+    }
 }
 
 void ClapBridge::unregister_plugin_instance(size_t instance_id) {
+    // L2: signal shutdown BEFORE remove_audio_thread so the
+    // audio_process_handler thread (parked in pi_cond_wait, not on the
+    // socket) wakes immediately and exits its loop. See
+    // Vst3Bridge::unregister_object_instance for the same pattern and
+    // reasoning. Note: get_instance() takes shared_lock briefly; the
+    // erase below in run_in_context takes unique_lock — signal_shutdown
+    // must complete before that or the audio thread would deadlock
+    // against the unique_lock waiter.
+    {
+        const auto& [instance, _] = get_instance(instance_id);
+        instance.audio_loop_stop.store(true, std::memory_order_release);
+        if (instance.audio_control_shm) {
+            instance.audio_control_shm->signal_shutdown();
+        }
+    }
     sockets_.remove_audio_thread(instance_id);
 
     // Remove the instance from within the main IO context so
