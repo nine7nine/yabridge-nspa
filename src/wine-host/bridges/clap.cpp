@@ -1336,6 +1336,64 @@ void ClapBridge::register_plugin_instance(
                                     handle_process(
                                         inst->pi_cond_process_request);
 
+                                // === NSPA L2 reply envelope (P5) ===
+                                //
+                                // After handle_process populated
+                                // out_events_, publish fixed-shape
+                                // events through reply_envelope_clap
+                                // and swap them out — bitsery encodes
+                                // an empty out_events_ list.  Block-
+                                // level fallback: variable-shape
+                                // variants (MidiSysex / Transport-as-
+                                // event) OR count > 256 keep the full
+                                // list on bitsery for this block.
+                                //
+                                // Owned buffer destructs at lambda
+                                // end — next iteration's handle_process
+                                // gets a capacity-only EventList,
+                                // which is exactly what the existing
+                                // reuse pattern expects.
+                                llvm::SmallVector<::clap::events::Event, 64>
+                                    reply_events_owned;
+                                if (inst->audio_control_shm
+                                        ->envelope_active()) {
+                                    auto& renv =
+                                        inst->audio_control_shm->layout()
+                                            .reply_envelope_clap;
+                                    uint32_t reply_flags = 0;
+                                    uint32_t reply_event_count = 0;
+
+                                    auto& list = inst
+                                        ->pi_cond_process_request.process
+                                        .out_events_;
+                                    const auto& evs = list.events_ref();
+                                    if (evs.size() <= yabridge::nspa::
+                                            max_clap_events_per_envelope) {
+                                        bool all_fixed = true;
+                                        for (size_t i = 0;
+                                             i < evs.size(); i++) {
+                                            if (!yabridge::nspa::
+                                                    clap_event_to_direct(
+                                                        evs[i],
+                                                        renv.events[i])) {
+                                                all_fixed = false;
+                                                break;
+                                            }
+                                        }
+                                        if (all_fixed) {
+                                            reply_event_count =
+                                                static_cast<uint32_t>(
+                                                    evs.size());
+                                            reply_flags |= yabridge::nspa::
+                                                clap_reply_envelope_flag_output_events_valid;
+                                            list.swap_events(
+                                                reply_events_owned);
+                                        }
+                                    }
+                                    renv.event_count = reply_event_count;
+                                    renv.flags = reply_flags;
+                                }
+
                                 const size_t reply_size =
                                     bitsery::quickSerialization<
                                         OutputAdapter<

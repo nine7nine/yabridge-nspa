@@ -420,6 +420,37 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
                     throw std::runtime_error(
                         "L2 CLAP ProcessResponse deserialization failed");
                 }
+
+                // === NSPA L2 reply envelope rehydrate (P5) ===
+                //
+                // Wine-host wrote out_events_ via reply_envelope_clap
+                // and shrank it to an empty list in the bitsery
+                // payload.  Refill here so write_back_outputs sees
+                // the populated EventList when called at the end of
+                // process().
+                if (self->audio_control_shm_->envelope_active()) {
+                    const auto& renv =
+                        self->audio_control_shm_->layout()
+                            .reply_envelope_clap;
+                    if (renv.flags &
+                        yabridge::nspa::
+                            clap_reply_envelope_flag_output_events_valid) {
+                        const uint32_t count = renv.event_count;
+                        if (count <= yabridge::nspa::
+                                max_clap_events_per_envelope)
+                            [[likely]] {
+                            auto& list =
+                                self->process_request_.process.out_events_;
+                            list.reserve_events(count);
+                            for (uint32_t i = 0; i < count; i++) {
+                                ::clap::events::Event e;
+                                yabridge::nspa::clap_event_from_direct(
+                                    renv.events[i], e);
+                                list.append_event(std::move(e));
+                            }
+                        }
+                    }
+                }
                 ok_dispatch = true;
             } catch (const std::exception& e) {
                 self->bridge_.logger_.log(

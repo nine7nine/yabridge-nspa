@@ -87,6 +87,9 @@ inline void clap_transport_from_direct(
 inline constexpr uint32_t clap_envelope_flag_transport_valid     = 1u << 0;
 inline constexpr uint32_t clap_envelope_flag_input_events_valid  = 1u << 1;
 
+// Flag bit definitions for ClapProcessReplyEnvelope::flags (P5).
+inline constexpr uint32_t clap_reply_envelope_flag_output_events_valid = 1u << 0;
+
 // Producer-side conversion of one ::clap::events::Event to the direct
 // envelope slot.  Returns true if the event is a fixed-shape variant
 // and was written; false if it carries a variable-shape variant

@@ -183,8 +183,9 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // Version 6 = VST3 request envelope grown with parameter queue array.
 // Version 7 = CLAP request envelope grown with fixed-shape event ring.
 // Version 8 = VST3 reply envelope (output_events_ + output param queues
-//             direct in shmem) (this commit).
-constexpr uint32_t audio_control_layout_version = 8;
+//             direct in shmem).
+// Version 9 = CLAP reply envelope (out_events_ direct) (this commit).
+constexpr uint32_t audio_control_layout_version = 9;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -628,6 +629,27 @@ static_assert(offsetof(ClapProcessEnvelope, events) % 64 == 0,
 static_assert(offsetof(ClapProcessEnvelope, events) == 192,
               "events array at offset 192 (cacheline after transport)");
 
+// CLAP reply-direction envelope (P5).  Carries out_events_ as a fixed-
+// shape event ring; no transport (transport is request-only).  Same
+// caps and ABI rules as the request side; variable-shape variants
+// (MidiSysex / Transport-as-event) force the whole output stream onto
+// the bitsery path for that block.
+//
+//   bit 0: output_events_valid
+struct alignas(64) ClapProcessReplyEnvelope {
+    uint32_t flags;
+    uint32_t event_count;
+    uint32_t _hdr_pad[14];
+
+    alignas(64) ClapProcessEventDirect events[max_clap_events_per_envelope];
+};
+static_assert(sizeof(ClapProcessReplyEnvelope) % 64 == 0,
+              "ClapProcessReplyEnvelope must be a multiple of cacheline size");
+static_assert(alignof(ClapProcessReplyEnvelope) == 64,
+              "ClapProcessReplyEnvelope cacheline-aligned");
+static_assert(offsetof(ClapProcessReplyEnvelope, events) % 64 == 0,
+              "CLAP reply events must start cacheline-aligned");
+
 // Environment variable that opts OUT of the direct-struct envelope path.
 // Default ON — verified 2026-05-13 on representative workload (ACE VST3
 // multi-core, dense MIDI CC + automation): bitsery encode/decode dropped
@@ -702,11 +724,13 @@ struct AudioControlShmLayout {
     alignas(64) Vst2ProcessEnvelope request_envelope_vst2;
     alignas(64) ClapProcessEnvelope request_envelope_clap;
 
-    // Per-format reply envelope sections.  Currently only VST3 is
-    // mirrored on the reply side (P5).  VST2 and CLAP reply-side
-    // envelopes are deferred — VST2 reply is minimal (no output
-    // event/param surface) and CLAP reply structure differs.
+    // Per-format reply envelope sections.  VST3 mirrors both events
+    // and param queues (P5).  CLAP mirrors out_events_.  VST2 reply
+    // is `Ack` (zero-byte response — audio data is in the
+    // AudioShmBuffer, no output event/param surface), so no VST2
+    // reply envelope exists.
     alignas(64) Vst3ProcessReplyEnvelope reply_envelope_vst3;
+    alignas(64) ClapProcessReplyEnvelope reply_envelope_clap;
 };
 
 static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
@@ -716,7 +740,8 @@ static_assert(sizeof(AudioControlShmLayout) >=
                    sizeof(Vst3ProcessEnvelope) +
                    sizeof(Vst2ProcessEnvelope) +
                    sizeof(ClapProcessEnvelope) +
-                   sizeof(Vst3ProcessReplyEnvelope)),
+                   sizeof(Vst3ProcessReplyEnvelope) +
+                   sizeof(ClapProcessReplyEnvelope)),
               "layout sanity check (with all envelope extensions)");
 
 // RAII handle to an AudioControlShm region. Holds the shm_open fd and
