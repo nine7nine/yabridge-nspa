@@ -334,32 +334,69 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
         // audio_control_buf_size; the audio buffers themselves live in
         // process_buffers_ (AudioShmBuffer).
         //
-        // === NSPA L2 direct-struct envelope write (P2: clap_event_transport_t) ===
+        // === NSPA L2 direct-struct envelope write ===
         //
-        // When envelope_active(), publish clap_event_transport_t
-        // directly into the shmem envelope and clear
-        // process_request_.process.transport_ so bitsery encodes a
-        // 1-byte "absent" optional tag instead of the full ~112-byte
-        // serialized struct.  Save into transport_for_fallback for
-        // the rare over-budget socket path which doesn't read the
-        // envelope and needs transport carried via bitsery.
+        //   P2 — clap_event_transport_t (cleared via reset + restored
+        //        via move on fallback).
+        //   P3 — in_events_ (events vector swapped out, refilled on
+        //        fallback).  Block-level fallback: if ANY event is a
+        //        variable-shape variant (Transport-as-event or
+        //        MidiSysex) OR count exceeds max_clap_events_per_envelope,
+        //        the entire event list stays on the bitsery path.
+        //
+        // Writes happen-before audio_control_send_and_wait's
+        // release-store inside the request pi_mutex; consumer's
+        // acquire-load synchronizes-with our store.
         std::optional<clap_event_transport_t> transport_for_fallback;
-        const bool envelope_publishes_transport =
-            self->audio_control_shm_->envelope_active() &&
-            self->process_request_.process.transport_.has_value();
-        if (envelope_publishes_transport) {
+        llvm::SmallVector<::clap::events::Event, 64> events_for_fallback;
+        bool envelope_publishes_transport = false;
+        bool envelope_publishes_events    = false;
+        if (self->audio_control_shm_->envelope_active()) {
             auto& env = self->audio_control_shm_->layout()
                             .request_envelope_clap;
-            yabridge::nspa::clap_transport_to_direct(
-                *self->process_request_.process.transport_, env.transport);
-            env.flags =
-                yabridge::nspa::clap_envelope_flag_transport_valid;
-            transport_for_fallback =
-                std::move(self->process_request_.process.transport_);
-            self->process_request_.process.transport_.reset();
-        } else if (self->audio_control_shm_->envelope_active()) {
-            self->audio_control_shm_->layout()
-                .request_envelope_clap.flags = 0;
+            uint32_t envelope_flags = 0;
+            uint32_t envelope_event_count = 0;
+
+            // P2: transport
+            if (self->process_request_.process.transport_.has_value()) {
+                yabridge::nspa::clap_transport_to_direct(
+                    *self->process_request_.process.transport_,
+                    env.transport);
+                envelope_flags |=
+                    yabridge::nspa::clap_envelope_flag_transport_valid;
+                transport_for_fallback =
+                    std::move(self->process_request_.process.transport_);
+                self->process_request_.process.transport_.reset();
+                envelope_publishes_transport = true;
+            }
+
+            // P3: in_events_ (fixed-shape variants only)
+            {
+                auto& list = self->process_request_.process.in_events_;
+                const auto& evs = list.events_ref();
+                if (evs.size() <=
+                    yabridge::nspa::max_clap_events_per_envelope) {
+                    bool all_fixed = true;
+                    for (size_t i = 0; i < evs.size(); i++) {
+                        if (!yabridge::nspa::clap_event_to_direct(
+                                evs[i], env.events[i])) {
+                            all_fixed = false;
+                            break;
+                        }
+                    }
+                    if (all_fixed) {
+                        envelope_event_count =
+                            static_cast<uint32_t>(evs.size());
+                        envelope_flags |= yabridge::nspa::
+                            clap_envelope_flag_input_events_valid;
+                        list.swap_events(events_for_fallback);
+                        envelope_publishes_events = true;
+                    }
+                }
+            }
+
+            env.event_count = envelope_event_count;
+            env.flags = envelope_flags;
         }
 
         const size_t request_size =
@@ -393,12 +430,17 @@ clap_plugin_proxy::plugin_process(const struct clap_plugin* plugin,
             }
         }
         if (!ok_dispatch) {
-            // Restore transport_ before socket fallback — the L2 envelope
-            // path cleared it from process_request_ to shrink the bitsery
-            // payload, but the socket transport doesn't read the envelope.
+            // Restore envelope-cleared fields before socket fallback —
+            // the L2 envelope path cleared / extracted them to shrink
+            // the bitsery payload, but the socket transport doesn't
+            // read the envelope.
             if (envelope_publishes_transport) {
                 self->process_request_.process.transport_ =
                     std::move(transport_for_fallback);
+            }
+            if (envelope_publishes_events) {
+                self->process_request_.process.in_events_.swap_events(
+                    events_for_fallback);
             }
             self->bridge_.receive_audio_thread_message_into(
                 MessageReference<clap::plugin::Process>(self->process_request_),

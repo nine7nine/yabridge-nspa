@@ -1284,14 +1284,10 @@ void ClapBridge::register_plugin_instance(
                                 }
 
                                 // === NSPA L2 direct-struct envelope
-                                //     override (P2: clap_event_transport_t) ===
-                                //
-                                // When envelope_active() and the
-                                // envelope flag is set, rehydrate
-                                // process_request_.process.transport_
-                                // from the shmem envelope.  The
-                                // producer cleared it from the bitsery
-                                // payload to shrink the wire format.
+                                //     override ===
+                                //   P2 — transport_.
+                                //   P3 — in_events_ (appended; bitsery
+                                //        decoded an empty events_).
                                 if (inst->audio_control_shm
                                         ->envelope_active()) {
                                     const auto& env =
@@ -1306,6 +1302,29 @@ void ClapBridge::register_plugin_instance(
                                                 env.transport, tp);
                                         inst->pi_cond_process_request.process
                                             .transport_ = tp;
+                                    }
+                                    if (env.flags &
+                                        yabridge::nspa::
+                                            clap_envelope_flag_input_events_valid) {
+                                        const uint32_t count =
+                                            env.event_count;
+                                        if (count <= yabridge::nspa::
+                                                max_clap_events_per_envelope)
+                                            [[likely]] {
+                                            auto& list = inst
+                                                ->pi_cond_process_request
+                                                .process.in_events_;
+                                            list.reserve_events(count);
+                                            for (uint32_t i = 0;
+                                                 i < count; i++) {
+                                                ::clap::events::Event e;
+                                                yabridge::nspa::
+                                                    clap_event_from_direct(
+                                                        env.events[i], e);
+                                                list.append_event(
+                                                    std::move(e));
+                                            }
+                                        }
                                     }
                                 }
 

@@ -287,6 +287,23 @@ class EventList {
         s.container(events_, 1 << 16);
     }
 
+    // L2 direct-struct envelope path support.  Mirror of the VST3
+    // YaEventList helpers — producer extracts events into a side
+    // buffer (so the bitsery encode shrinks to "0 events"), then
+    // swaps back on socket-fallback.  Consumer refills from the
+    // envelope via append_event() after a bitsery decode that saw an
+    // empty events_ vector.
+    const llvm::SmallVector<Event, 64>& events_ref() const noexcept {
+        return events_;
+    }
+    void swap_events(llvm::SmallVector<Event, 64>& other) noexcept {
+        events_.swap(other);
+    }
+    void reserve_events(size_t n) { events_.reserve(n); }
+    void append_event(Event&& e) noexcept {
+        events_.push_back(std::move(e));
+    }
+
    private:
     llvm::SmallVector<Event, 64> events_;
 

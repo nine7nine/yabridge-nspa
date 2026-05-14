@@ -180,9 +180,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // Version 3 = VST2 request envelope with VstTimeInfo direct.
 // Version 4 = CLAP request envelope with clap_event_transport_t direct.
 // Version 5 = VST3 request envelope grown with fixed-shape event ring.
-// Version 6 = VST3 request envelope grown with parameter queue array
+// Version 6 = VST3 request envelope grown with parameter queue array.
+// Version 7 = CLAP request envelope grown with fixed-shape event ring
 //             (this commit).
-constexpr uint32_t audio_control_layout_version = 6;
+constexpr uint32_t audio_control_layout_version = 7;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -454,6 +455,88 @@ static_assert(sizeof(ClapEventHeaderDirect) == 16,
 static_assert(alignof(ClapEventHeaderDirect) == 4,
               "ClapEventHeaderDirect ABI: 4-byte natural alignment");
 
+// Direct-struct mirror of fixed-shape CLAP events (Note / NoteExpression
+// / ParamValue / ParamMod / ParamGesture / Midi / Midi2).  Variable-
+// shape variants (Transport-as-event and MidiSysex) fall back to the
+// bitsery path for that block.  64 bytes total — 16-byte header +
+// 48-byte payload union sized to the largest fixed variant
+// (ParamValue / ParamMod: 40 bytes used + 8 pad).  Cacheline-friendly
+// (sizeof multiple of 16; 4 events per cacheline).  Conversion helpers
+// in `common/serialization/clap-direct-envelope.h`.
+struct alignas(16) ClapProcessEventDirect {
+    ClapEventHeaderDirect header;        // 0  (16 bytes)
+    union {
+        // clap_event_note_t — NOTE_ON / NOTE_OFF / NOTE_CHOKE / NOTE_END
+        struct {
+            int32_t  note_id;            // 0
+            int16_t  port_index;         // 4
+            int16_t  channel;            // 6
+            int16_t  key;                // 8
+            int16_t  _pad0;              // 10
+            uint32_t _pad1;              // 12
+            double   velocity;           // 16
+            uint8_t  _tail_pad[24];      // 24
+        } note;                          // 48 bytes
+        // clap_event_note_expression_t
+        struct {
+            int32_t  expression_id;      // 0
+            int32_t  note_id;            // 4
+            int16_t  port_index;         // 8
+            int16_t  channel;            // 10
+            int16_t  key;                // 12
+            int16_t  _pad0;              // 14
+            double   value;              // 16
+            uint8_t  _tail_pad[24];      // 24
+        } note_expression;               // 48 bytes
+        // clap_event_param_value_t / clap_event_param_mod_t — same shape
+        struct {
+            uint32_t param_id;           // 0
+            uint32_t _pad0;              // 4
+            uint64_t cookie;             // 8   void* opaque
+            int32_t  note_id;            // 16
+            int16_t  port_index;         // 20
+            int16_t  channel;            // 22
+            int16_t  key;                // 24
+            int16_t  _pad1;              // 26
+            uint32_t _pad2;              // 28
+            double   value_or_amount;    // 32
+            uint8_t  _tail_pad[8];       // 40
+        } param_value_or_mod;            // 48 bytes
+        // clap_event_param_gesture_t — BEGIN / END
+        struct {
+            uint32_t param_id;           // 0
+            uint8_t  _tail_pad[44];      // 4
+        } param_gesture;                 // 48 bytes
+        // clap_event_midi_t
+        struct {
+            uint16_t port_index;         // 0
+            uint8_t  data[3];            // 2
+            uint8_t  _tail_pad[43];      // 5
+        } midi;                          // 48 bytes
+        // clap_event_midi2_t
+        struct {
+            uint16_t port_index;         // 0
+            uint16_t _pad0;              // 2
+            uint32_t data[4];            // 4
+            uint8_t  _tail_pad[28];      // 20
+        } midi2;                         // 48 bytes
+        uint8_t raw[48];
+    } payload;                           // 48 bytes — starts at offset 16
+};
+static_assert(sizeof(ClapProcessEventDirect) == 64,
+              "ClapProcessEventDirect ABI: 64-byte layout sanity check");
+static_assert(alignof(ClapProcessEventDirect) == 16,
+              "ClapProcessEventDirect ABI: 16-byte natural alignment");
+static_assert(offsetof(ClapProcessEventDirect, payload) == 16,
+              "ClapProcessEventDirect payload at offset 16");
+
+// Maximum number of fixed-shape CLAP events the envelope can carry in
+// one block.  Sized for typical synthesizer load (one event per few
+// samples) at 256-sample buffer sizes.  Variable-shape variants
+// (Transport-as-event, MidiSysex) or counts above this force the
+// entire input event list back onto the bitsery path for that block.
+constexpr size_t max_clap_events_per_envelope = 256;
+
 // Direct-struct mirror of `clap_event_transport_t`.  All-POD wire
 // format with explicit padding to keep 8-byte int64/double natural
 // alignment.  112 bytes total.  Conversion helpers in
@@ -481,18 +564,25 @@ static_assert(sizeof(ClapTransportDirect) == 112,
 static_assert(alignof(ClapTransportDirect) == 8,
               "ClapTransportDirect ABI: 8-byte natural alignment");
 
-// CLAP request-direction envelope.  Carries the fixed-shape per-block
-// transport field.  P2 (this commit) covers clap_event_transport_t
-// only — variable-size event stream (mixed param changes + MIDI) is
-// deferred to a later phase pending measurement.
+// CLAP request-direction envelope.  Carries fixed-shape per-block
+// fields that the direct-struct path replaces bitsery for.
+//   P2 — clap_event_transport_t (transport_).
+//   P3 (this commit) — fixed-shape event ring (in_events_).
+//                      Variable-shape variants (Transport-as-event,
+//                      MidiSysex) keep the entire block on bitsery.
 struct alignas(64) ClapProcessEnvelope {
-    // Header — first cacheline.  bit 0: transport_valid.
+    // Header — first cacheline.
+    //   bit 0: transport_valid
+    //   bit 1: in_events_valid (event_count entries in events[])
     uint32_t flags;
-    uint32_t _hdr_pad[15];
+    uint32_t event_count;                // P3: count of valid events
+    uint32_t _hdr_pad[14];
 
-    // Transport payload — starts at offset 64 (next cacheline).
-    ClapTransportDirect transport;       // 112 bytes
-    // trailing pad to next 64-byte boundary handled by struct alignas
+    // Transport payload — own cacheline (offset 64).
+    ClapTransportDirect transport;       // 112 bytes (64..175)
+
+    // Event ring — cacheline-aligned (compiler inserts pad 176..191).
+    alignas(64) ClapProcessEventDirect events[max_clap_events_per_envelope];
 };
 static_assert(sizeof(ClapProcessEnvelope) % 64 == 0,
               "ClapProcessEnvelope must be a multiple of cacheline size");
@@ -500,6 +590,10 @@ static_assert(alignof(ClapProcessEnvelope) == 64,
               "ClapProcessEnvelope cacheline-aligned");
 static_assert(offsetof(ClapProcessEnvelope, transport) == 64,
               "transport must start at offset 64 (own cacheline)");
+static_assert(offsetof(ClapProcessEnvelope, events) % 64 == 0,
+              "events array must start cacheline-aligned");
+static_assert(offsetof(ClapProcessEnvelope, events) == 192,
+              "events array at offset 192 (cacheline after transport)");
 
 // Environment variable that opts INTO the direct-struct envelope path.
 // Default off — incremental rollout gate. Will be flipped to default-on
