@@ -24,17 +24,18 @@
 
 namespace yabridge::nspa {
 
-// Direct-struct envelope rollout gate.  Returns the cached result of
-// reading YABRIDGE_DIRECT_ENVELOPE at process startup.  See header for
-// rollout policy.  Subsequent calls return without touching the
-// environment, so the function is RT-safe after first invocation —
-// call sites should trigger the initial getenv before the audio thread
-// starts (typical pattern: read once during AudioControlShm construction).
+// Direct-struct envelope path: ON by default.  YABRIDGE_DIRECT_ENVELOPE=0
+// is the diagnostic opt-out (forces every block onto the bitsery path,
+// useful for A/B and bug triage).  Result is cached at first call so
+// the function is RT-safe after process startup — call sites should
+// trigger the initial getenv before the audio thread starts (typical
+// pattern: read once during AudioControlShm construction).
 bool direct_envelope_enabled() noexcept {
     static const bool enabled = [] {
         // NOLINTNEXTLINE(concurrency-mt-unsafe)
         const char* val = std::getenv(direct_envelope_env_var);
-        return val != nullptr && val[0] == '1' && val[1] == '\0';
+        // Default on.  Explicit "0" → off (diagnostic opt-out).
+        return !(val != nullptr && val[0] == '0' && val[1] == '\0');
     }();
     return enabled;
 }

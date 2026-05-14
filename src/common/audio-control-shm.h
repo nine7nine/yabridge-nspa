@@ -628,15 +628,20 @@ static_assert(offsetof(ClapProcessEnvelope, events) % 64 == 0,
 static_assert(offsetof(ClapProcessEnvelope, events) == 192,
               "events array at offset 192 (cacheline after transport)");
 
-// Environment variable that opts INTO the direct-struct envelope path.
-// Default off — incremental rollout gate. Will be flipped to default-on
-// opt-out after measurement validates the gain on representative
-// workloads, then the gate is removed once the path is stable.
+// Environment variable that opts OUT of the direct-struct envelope path.
+// Default ON — verified 2026-05-13 on representative workload (ACE VST3
+// multi-core, dense MIDI CC + automation): bitsery encode/decode dropped
+// from a measurable hot symbol to 0.10% of wine-host CPU combined,
+// pi_mutex_lock to 0.01%.  See commit message for full findings.
+//
+// YABRIDGE_DIRECT_ENVELOPE=0 forces every block onto the bitsery path —
+// kept as a diagnostic opt-out for A/B comparison and bug triage.  Any
+// other value (including unset) keeps the envelope path on.
 constexpr char direct_envelope_env_var[] = "YABRIDGE_DIRECT_ENVELOPE";
 
-// Returns true if YABRIDGE_DIRECT_ENVELOPE=1 in the process environment.
+// Returns true unless YABRIDGE_DIRECT_ENVELOPE=0 in the environment.
 // Cached on first call — subsequent calls do not touch the environment,
-// so this is safe to call from RT contexts after process startup. The
+// so this is safe to call from RT contexts after process startup.  The
 // initial call is NOT RT-safe (it does getenv), so call sites should
 // trigger it before the audio thread starts.
 bool direct_envelope_enabled() noexcept;
