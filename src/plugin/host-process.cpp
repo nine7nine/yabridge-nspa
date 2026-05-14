@@ -16,11 +16,99 @@
 
 #include "host-process.h"
 
+#include <chrono>
+#include <thread>
+
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <asio/read_until.hpp>
 
 #include "../common/utils.h"
 
 namespace fs = ghc::filesystem;
+
+namespace {
+
+// Wineserver creates its master socket at /tmp/.wine-<uid>/server-<x-y>/socket.
+// Returns true if any such socket exists for the current effective uid —
+// i.e., a wineserver appears to be already running for this user.
+bool wineserver_socket_present() noexcept {
+    const std::string dir = "/tmp/.wine-" + std::to_string(geteuid());
+    std::error_code err;
+    if (!fs::is_directory(dir, err)) {
+        return false;
+    }
+    for (const auto& entry : fs::directory_iterator(dir, err)) {
+        if (err) {
+            break;
+        }
+        if (entry.path().filename().string().rfind("server-", 0) == 0) {
+            if (fs::exists(entry.path() / "socket", err)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Pre-warm wineserver so the actual `yabridge-host.exe` launch always
+// sees a wineserver that's already past its init.  Fast-path no-op when
+// one is already running.  When cold, spawns `wineserver -p` (persistent
+// daemon) directly and polls for the master socket to appear.
+//
+// Workaround for an Element-specific cold-spawn failure mode discovered
+// 2026-05-13 where wineserver self-promotion completes but the first
+// wine client launched from Element's process tree exits silently with
+// no diagnostic before its banner — likely a fast-startup race that
+// NSPA RT's accelerated init exposes (vanilla wine init is slow enough
+// that the race window doesn't manifest).  Every DAW we've tested loads
+// plugins fine when wineserver is already warm (from a prior session,
+// from `wineserver -p` standalone, or from any prior wine call); Element
+// is the only DAW that reproduces the cold-spawn failure.
+//
+// yabridge does NOT take over wineserver lifecycle.  This only ensures
+// wineserver is alive before we spawn yabridge-host; wineserver still
+// auto-times-out 3s after the last client disconnects on its own.
+//
+// `wineserver -p` is idempotent: when one is already running, the bind()
+// on the master socket fails and the second instance exits cleanly.  Our
+// fast-path check skips the spawn altogether in the warm case anyway.
+void ensure_wineserver_warm() noexcept {
+    if (wineserver_socket_present()) {
+        return;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        // fork failed — proceed and hope wine can spawn wineserver itself.
+        return;
+    }
+    if (child == 0) {
+        // child: exec wineserver -p (persistent / daemonize).
+        execlp("wineserver", "wineserver", "-p",
+               static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    // -p daemonizes via fork, so our direct child exits fast.
+    waitpid(child, nullptr, 0);
+
+    // Poll for the wineserver master socket to appear.  Cap at ~2s to
+    // avoid hanging plugin construction if wineserver is genuinely
+    // broken (in which case the subsequent yabridge-host launch will
+    // hit our `connect_sockets_guarded` watchdog and report failure
+    // cleanly).
+    using namespace std::chrono_literals;
+    for (int i = 0; i < 40; i++) {
+        if (wineserver_socket_present()) {
+            return;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+}
+
+}  // namespace
 
 HostProcess::HostProcess(asio::io_context& io_context, Sockets& sockets)
     : sockets_(sockets), stdout_pipe_(io_context), stderr_pipe_(io_context) {}
@@ -31,6 +119,13 @@ Process::Handle HostProcess::launch_host(
     Logger& logger,
     const Configuration& config,
     const PluginInfo& plugin_info) {
+    // Bullet-proofing: make sure wineserver is alive before spawning
+    // yabridge-host.exe.  Sidesteps a cold-spawn race exposed by some
+    // DAWs (Element specifically) where the first wine client launched
+    // from the DAW's process tree exits silently during wineserver
+    // init.  Fast no-op when wineserver is already warm.
+    ensure_wineserver_warm();
+
 #ifdef WITH_WINEDBG
     // This is set up for KDE Plasma. Other desktop environments and window
     // managers require some slight modifications to spawn a detached terminal
