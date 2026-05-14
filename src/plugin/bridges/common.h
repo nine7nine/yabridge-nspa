@@ -355,23 +355,33 @@ class PluginBridge {
     }
 
     /**
-     * Connect the sockets, while starting another thread that will terminate
-     * the plugin (through `std::terminate`/SIGABRT) when the host process fails
-     * to start. This is the only way to stop listening on our sockets without
-     * moving everything over to asynchronous listeners (which may actually be a
-     * good idea just for this use case). Otherwise the plugin would be stuck
-     * loading indefinitely when Wine is not configured correctly.
+     * Connect the sockets, while starting another thread that will throw a
+     * `std::runtime_error` from the bridge constructor when the Wine host
+     * process fails to start.  The plugin factory entry points
+     * (`VSTPluginMain` / `Vst3PluginFactory::createInstance` / CLAP factory)
+     * catch the exception and report failure to the DAW host — they will NOT
+     * `std::terminate()` and bring the DAW down with them.
      *
-     * TODO: Asynchronously connect our sockets so we can interrupt it, maybe
+     * Interruption mechanism: the watchdog calls `sockets_.close()` on host
+     * death, which unblocks the asio `acceptor_->accept()` in this thread
+     * (it throws `std::system_error`).  We rewrap that into a useful
+     * `std::runtime_error` so the diagnostic message tells the user the host
+     * died rather than reporting a generic socket error.
+     *
+     * History: this previously called `std::terminate()` directly on host
+     * death.  Every wine-side init failure (cold-spawn race, plugin DLL
+     * issue, any wine-nspa flake) would SIGABRT the DAW.  Element + a
+     * startup VST3 scan was the trigger that surfaced it.  Bullet-proofing
+     * rule: an internal yabridge failure must never kill the DAW.
      */
     void connect_sockets_guarded() {
 #ifndef WITH_WINEDBG
-        // If the Wine process fails to start, then nothing will connect to the
-        // sockets and we'll be hanging here indefinitely. To prevent this,
-        // we'll periodically poll whether the Wine process is still running,
-        // and throw when it is not. The alternative would be to rewrite this to
-        // using `async_accept`, Asio timers, and another IO context, but
-        // I feel like this a much simpler solution.
+        // Signalled by the watchdog when the host process exits before our
+        // accept completes.  Read by the post-`sockets_.connect()` check
+        // below; if set, we throw a typed runtime_error which propagates out
+        // of the bridge constructor into the plugin factory's catch.
+        std::atomic<bool> host_failed_to_start{false};
+
         host_watchdog_handler_ = std::jthread([&](std::stop_token st) {
             using namespace std::literals::chrono_literals;
 
@@ -379,6 +389,8 @@ class PluginBridge {
 
             while (!st.stop_requested()) {
                 if (!plugin_host_->running()) {
+                    host_failed_to_start.store(true,
+                                               std::memory_order_release);
                     generic_logger_.log(
                         "The Wine host process has exited unexpectedly. Check "
                         "the output above for more information.");
@@ -393,7 +405,12 @@ class PluginBridge {
                         "see the error.",
                         info_.native_library_path_);
 
-                    std::terminate();
+                    // Interrupt the blocking `acceptor_->accept()` in the
+                    // construction thread by closing the listening sockets.
+                    // asio raises `std::system_error` from the accept, which
+                    // we re-throw as a typed runtime_error below.
+                    sockets_.close();
+                    return;
                 }
 
                 std::this_thread::sleep_for(20ms);
@@ -401,9 +418,34 @@ class PluginBridge {
         });
 #endif
 
-        sockets_.connect();
+        try {
+            sockets_.connect();
+        } catch (const std::exception&) {
+#ifndef WITH_WINEDBG
+            // If the watchdog tripped, surface the host-died diagnostic
+            // rather than the generic socket error.  jthread destructor
+            // will join the watchdog cleanly as we unwind.
+            if (host_failed_to_start.load(std::memory_order_acquire)) {
+                throw std::runtime_error(
+                    "Wine plugin host process exited before bridge "
+                    "construction completed");
+            }
+#endif
+            // Some other socket failure — re-throw as-is.
+            throw;
+        }
+
 #ifndef WITH_WINEDBG
         host_watchdog_handler_.request_stop();
+        // Race: host may have died between `sockets_.connect()` returning
+        // and `request_stop()` taking effect.  The watchdog could still
+        // set host_failed_to_start before observing the stop.  Catch that
+        // here so plugin construction reports failure consistently.
+        if (host_failed_to_start.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "Wine plugin host process exited before bridge "
+                "construction completed");
+        }
 #endif
     }
 
