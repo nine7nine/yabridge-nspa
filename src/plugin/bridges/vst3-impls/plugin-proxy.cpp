@@ -448,6 +448,62 @@ Vst3PluginProxyImpl::process(Steinberg::Vst::ProcessData& data) {
                     throw std::runtime_error(
                         "L2 VST3 ProcessResponse deserialization failed");
                 }
+
+                // === NSPA L2 reply envelope rehydrate (P5) ===
+                //
+                // Wine-host wrote output_events_ /
+                // output_parameter_changes_ via reply_envelope_vst3 and
+                // shrank them to engaged-but-empty in the bitsery
+                // payload.  Refill on this side so write_back_outputs
+                // sees the populated containers.
+                if (audio_control_shm_->envelope_active()) {
+                    const auto& renv =
+                        audio_control_shm_->layout().reply_envelope_vst3;
+                    if ((renv.flags &
+                         yabridge::nspa::
+                             vst3_reply_envelope_flag_output_events_valid) &&
+                        process_request_.data.output_events_
+                            .has_value()) {
+                        const uint32_t count = renv.event_count;
+                        if (count <= yabridge::nspa::
+                                max_events_per_envelope) [[likely]] {
+                            auto& list =
+                                *process_request_.data.output_events_;
+                            list.reserve_events(count);
+                            for (uint32_t i = 0; i < count; i++) {
+                                YaEvent y;
+                                yabridge::nspa::yaevent_from_direct(
+                                    renv.events[i], y);
+                                list.append_event(std::move(y));
+                            }
+                        }
+                    }
+                    if ((renv.flags &
+                         yabridge::nspa::
+                             vst3_reply_envelope_flag_output_param_changes_valid) &&
+                        process_request_.data.output_parameter_changes_
+                            .has_value()) {
+                        const uint32_t qcount = renv.queue_count;
+                        if (qcount <= yabridge::nspa::
+                                max_param_queues_per_envelope)
+                            [[likely]] {
+                            auto& changes = *process_request_.data
+                                                 .output_parameter_changes_;
+                            for (uint32_t i = 0; i < qcount; i++) {
+                                int32 unused_idx = 0;
+                                Steinberg::Vst::IParamValueQueue* q =
+                                    changes.addParameterData(
+                                        renv.param_queues[i].parameter_id,
+                                        unused_idx);
+                                if (q) [[likely]] {
+                                    yabridge::nspa::
+                                        param_queue_from_direct(
+                                            renv.param_queues[i], *q);
+                                }
+                            }
+                        }
+                    }
+                }
                 ok_dispatch = true;
             } catch (const std::exception& e) {
                 bridge_.logger_.log(

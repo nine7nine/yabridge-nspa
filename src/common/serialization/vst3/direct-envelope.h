@@ -102,6 +102,10 @@ inline constexpr uint32_t vst3_envelope_flag_process_context_valid    = 1u << 0;
 inline constexpr uint32_t vst3_envelope_flag_input_events_valid       = 1u << 1;
 inline constexpr uint32_t vst3_envelope_flag_input_param_changes_valid = 1u << 2;
 
+// Flag bit definitions for Vst3ProcessReplyEnvelope::flags (P5).
+inline constexpr uint32_t vst3_reply_envelope_flag_output_events_valid        = 1u << 0;
+inline constexpr uint32_t vst3_reply_envelope_flag_output_param_changes_valid = 1u << 1;
+
 // Producer-side conversion of a single YaParamValueQueue to the direct
 // envelope slot.  Returns true if the queue's point count fits within
 // max_param_points_per_queue and was written; false otherwise — the

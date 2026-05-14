@@ -2309,6 +2309,125 @@ size_t Vst3Bridge::register_object_instance(
                                         handle_process(
                                             inst->pi_cond_process_request);
 
+                                    // === NSPA L2 reply envelope (P5) ===
+                                    //
+                                    // After the plugin has populated
+                                    // output_events_ / output_parameter_changes_,
+                                    // and BEFORE bitsery serializes the
+                                    // Response (which forwards via
+                                    // pointers to those fields), publish
+                                    // them through the reply envelope
+                                    // and swap the inner vectors out so
+                                    // bitsery encodes minimal optionals.
+                                    // Plugin-proxy will refill on the
+                                    // other side.  Same fixed-shape
+                                    // gating as the request side
+                                    // (events: variable-payload → keep
+                                    // on bitsery; param queues: queue
+                                    // count > 32 OR any point count
+                                    // > 64 → keep on bitsery).
+                                    // These hold the swapped-out vectors
+                                    // through the rest of this iteration
+                                    // and destruct at lambda end — by
+                                    // then bitsery has serialized the
+                                    // shrunken optionals.  Next loop
+                                    // iteration's handle_process gets a
+                                    // capacity-only output_events_ /
+                                    // output_parameter_changes_ which is
+                                    // exactly what the existing reuse
+                                    // pattern expects.
+                                    llvm::SmallVector<YaEvent, 64>
+                                        reply_events_owned;
+                                    llvm::SmallVector<
+                                        YaParamValueQueue, 16>
+                                        reply_params_owned;
+                                    if (inst->audio_control_shm
+                                            ->envelope_active()) {
+                                        auto& renv =
+                                            inst->audio_control_shm
+                                                ->layout()
+                                                .reply_envelope_vst3;
+                                        uint32_t reply_flags = 0;
+                                        uint32_t reply_event_count = 0;
+                                        uint32_t reply_queue_count = 0;
+
+                                        auto& outev = inst
+                                            ->pi_cond_process_request.data
+                                            .output_events_;
+                                        if (outev.has_value()) {
+                                            auto& list = *outev;
+                                            const auto& evs =
+                                                list.events_ref();
+                                            if (evs.size() <=
+                                                yabridge::nspa::
+                                                    max_events_per_envelope) {
+                                                bool all_fixed = true;
+                                                for (size_t i = 0;
+                                                     i < evs.size();
+                                                     i++) {
+                                                    if (!yabridge::nspa::
+                                                            yaevent_to_direct(
+                                                                evs[i],
+                                                                renv.events[i])) {
+                                                        all_fixed = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (all_fixed) {
+                                                    reply_event_count =
+                                                        static_cast<uint32_t>(
+                                                            evs.size());
+                                                    reply_flags |=
+                                                        yabridge::nspa::
+                                                            vst3_reply_envelope_flag_output_events_valid;
+                                                    list.swap_events(
+                                                        reply_events_owned);
+                                                }
+                                            }
+                                        }
+
+                                        auto& outpc = inst
+                                            ->pi_cond_process_request.data
+                                            .output_parameter_changes_;
+                                        if (outpc.has_value()) {
+                                            auto& changes = *outpc;
+                                            const auto& queues =
+                                                changes.queues_ref();
+                                            if (queues.size() <=
+                                                yabridge::nspa::
+                                                    max_param_queues_per_envelope) {
+                                                bool all_fit = true;
+                                                for (size_t i = 0;
+                                                     i < queues.size();
+                                                     i++) {
+                                                    if (!yabridge::nspa::
+                                                            param_queue_to_direct(
+                                                                queues[i],
+                                                                renv.param_queues[i])) {
+                                                        all_fit = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (all_fit) {
+                                                    reply_queue_count =
+                                                        static_cast<uint32_t>(
+                                                            queues.size());
+                                                    reply_flags |=
+                                                        yabridge::nspa::
+                                                            vst3_reply_envelope_flag_output_param_changes_valid;
+                                                    changes.swap_queues(
+                                                        reply_params_owned);
+                                                }
+                                            }
+                                        }
+
+                                        renv.event_count =
+                                            reply_event_count;
+                                        renv.queue_count =
+                                            reply_queue_count;
+                                        renv.flags = reply_flags;
+                                    }
+
                                     // Serialize ProcessResponse into
                                     // pi_cond_reply_local. The response
                                     // contains pointers back into the

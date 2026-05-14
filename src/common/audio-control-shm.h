@@ -181,9 +181,10 @@ constexpr size_t audio_control_buf_size = size_t{64} * 1024;
 // Version 4 = CLAP request envelope with clap_event_transport_t direct.
 // Version 5 = VST3 request envelope grown with fixed-shape event ring.
 // Version 6 = VST3 request envelope grown with parameter queue array.
-// Version 7 = CLAP request envelope grown with fixed-shape event ring
-//             (this commit).
-constexpr uint32_t audio_control_layout_version = 7;
+// Version 7 = CLAP request envelope grown with fixed-shape event ring.
+// Version 8 = VST3 reply envelope (output_events_ + output param queues
+//             direct in shmem) (this commit).
+constexpr uint32_t audio_control_layout_version = 8;
 
 // Direct-struct representation of VST3's Steinberg::Vst::ProcessContext.
 // Wire format only — producer (plugin-lib) and consumer (wine-host)
@@ -393,6 +394,38 @@ static_assert(offsetof(Vst3ProcessEnvelope, events) == 192,
               "events array at offset 192 (cacheline after process_context)");
 static_assert(offsetof(Vst3ProcessEnvelope, param_queues) % 16 == 0,
               "param_queues array must start 16-aligned");
+
+// VST3 reply-direction envelope.  Mirror-shape of the request
+// envelope's event ring + param queue array, used for output_events_
+// and output_parameter_changes_ on the response side (P5).  No
+// ProcessContext on the response — that's a request-only field.
+//
+//   bit 0: output_events_valid
+//   bit 1: output_param_changes_valid
+//
+// Same caps as the request side (256 events, 32 queues × 64 points).
+// Layout: header on cacheline 0, events[] on cacheline-aligned
+// payload, param_queues[] 16-aligned after events.  Total size
+// matches the request envelope minus the 112-byte process_context
+// cacheline.
+struct alignas(64) Vst3ProcessReplyEnvelope {
+    uint32_t flags;
+    uint32_t event_count;
+    uint32_t queue_count;
+    uint32_t _hdr_pad[13];
+
+    alignas(64) ProcessEventDirect events[max_events_per_envelope];
+    alignas(16)
+        ProcessParamQueueDirect param_queues[max_param_queues_per_envelope];
+};
+static_assert(sizeof(Vst3ProcessReplyEnvelope) % 64 == 0,
+              "Vst3ProcessReplyEnvelope must be a multiple of cacheline size");
+static_assert(alignof(Vst3ProcessReplyEnvelope) == 64,
+              "Vst3ProcessReplyEnvelope cacheline-aligned");
+static_assert(offsetof(Vst3ProcessReplyEnvelope, events) % 64 == 0,
+              "reply events must start cacheline-aligned");
+static_assert(offsetof(Vst3ProcessReplyEnvelope, param_queues) % 16 == 0,
+              "reply param_queues must start 16-aligned");
 
 // Direct-struct representation of VST2's `VstTimeInfo` (vestige
 // `aeffectx.h` class).  Field-for-field mirror with explicit-width
@@ -663,6 +696,12 @@ struct AudioControlShmLayout {
     alignas(64) Vst3ProcessEnvelope request_envelope_vst3;
     alignas(64) Vst2ProcessEnvelope request_envelope_vst2;
     alignas(64) ClapProcessEnvelope request_envelope_clap;
+
+    // Per-format reply envelope sections.  Currently only VST3 is
+    // mirrored on the reply side (P5).  VST2 and CLAP reply-side
+    // envelopes are deferred — VST2 reply is minimal (no output
+    // event/param surface) and CLAP reply structure differs.
+    alignas(64) Vst3ProcessReplyEnvelope reply_envelope_vst3;
 };
 
 static_assert(offsetof(AudioControlShmLayout, req_lock) == 0,
@@ -671,8 +710,9 @@ static_assert(sizeof(AudioControlShmLayout) >=
                   (2 * audio_control_buf_size + 320 + 64 +
                    sizeof(Vst3ProcessEnvelope) +
                    sizeof(Vst2ProcessEnvelope) +
-                   sizeof(ClapProcessEnvelope)),
-              "layout sanity check (with all three envelope extensions)");
+                   sizeof(ClapProcessEnvelope) +
+                   sizeof(Vst3ProcessReplyEnvelope)),
+              "layout sanity check (with all envelope extensions)");
 
 // RAII handle to an AudioControlShm region. Holds the shm_open fd and
 // the mmap pointer. Constructor mode controls whether we create
