@@ -66,6 +66,7 @@ vst2_plugin_sources = files(
   '../include/llvm/small-vector.cpp',
   'bridges/vst2.cpp',
   'host-process.cpp',
+  'orphan-cleanup.cpp',
   'utils.cpp',
   'vst2-plugin.cpp',
 )
@@ -98,6 +99,7 @@ if with_clap
     'bridges/clap-impls/plugin-factory-proxy.cpp',
     'bridges/clap.cpp',
     'host-process.cpp',
+    'orphan-cleanup.cpp',
     'utils.cpp',
     'clap-plugin.cpp',
   )
@@ -177,6 +179,7 @@ if with_vst3
     'bridges/vst3-impls/plug-view-proxy.cpp',
     'bridges/vst3-impls/plugin-proxy.cpp',
     'host-process.cpp',
+    'orphan-cleanup.cpp',
     'utils.cpp',
     'vst3-plugin.cpp',
   )

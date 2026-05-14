@@ -19,6 +19,8 @@
 #include <random>
 #include <sstream>
 
+#include <unistd.h>
+
 #include "../utils.h"
 
 namespace fs = ghc::filesystem;
@@ -44,9 +46,22 @@ ghc::filesystem::path generate_endpoint_base(const std::string& plugin_name) {
 
         // We'll get rid of the file descriptors immediately after accepting the
         // sockets, so putting them inside of a subdirectory would only leave
-        // behind an empty directory
+        // behind an empty directory.
+        //
+        // NSPA addition: append `-pid<N>` sentinel where N is the plugin-lib's
+        // getpid().  Every downstream artifact (socket dir, AudioShmBuffer
+        // shm files, L2 audio_ctl shm files) is derived from this base name,
+        // so embedding the owner PID once propagates to all of them.  The
+        // orphan-state cleanup pass on plugin-lib init (see
+        // `clean_orphan_yabridge_state` in src/plugin/utils.cpp) parses the
+        // PID back out of the filename and tests `/proc/<PID>` to decide
+        // whether a leftover file belongs to a live session or a crashed
+        // one.  Using a `pid` sentinel rather than positional digits keeps
+        // parsing unambiguous even when suffixes like `-vst3-N.audio_ctl`
+        // are appended later.
         std::ostringstream socket_name;
-        socket_name << "yabridge-" << plugin_name << "-" << random_id;
+        socket_name << "yabridge-" << plugin_name << "-" << random_id
+                    << "-pid" << getpid();
 
         candidate_endpoint = temp_directory / socket_name.str();
     } while (fs::exists(candidate_endpoint));

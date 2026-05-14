@@ -19,6 +19,7 @@
 
 #include "../common/linking.h"
 #include "bridges/vst3.h"
+#include "orphan-cleanup.h"
 
 // FIXME: The VST3 SDK as of version 3.7.2 now includes multiple local functions
 //        called `InitModule` and `DeinitModule`: one in the new
@@ -95,6 +96,8 @@ void log_init_error(const std::exception& error, const fs::path& plugin_path) {
 bool InitModule() {
     assert(!bridge);
 
+    yabridge::nspa::clean_orphan_yabridge_state();
+
     const fs::path plugin_path = get_this_file_location();
     try {
         bridge = std::make_unique<Vst3PluginBridge>(plugin_path);
@@ -138,6 +141,8 @@ GetPluginFactory() {
 extern "C" YABRIDGE_EXPORT Vst3PluginBridge* yabridge_module_init(
     const char* plugin_path) {
     assert(plugin_path);
+
+    yabridge::nspa::clean_orphan_yabridge_state();
 
     try {
         return new Vst3PluginBridge(plugin_path);

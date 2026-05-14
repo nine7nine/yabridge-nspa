@@ -21,6 +21,7 @@
 
 #include "../common/linking.h"
 #include "bridges/vst2.h"
+#include "orphan-cleanup.h"
 
 using namespace std::literals::string_literals;
 
@@ -85,6 +86,12 @@ extern "C" YABRIDGE_EXPORT AEffect* VSTPluginMain(
     audioMasterCallback host_callback) {
     assert(host_callback);
 
+    // Idempotent one-shot orphan cleanup of stale yabridge IPC state
+    // from prior crashed sessions.  Runs once per libyabridge.so load
+    // via internal std::call_once guard; safe to call from every
+    // plugin construction path.
+    yabridge::nspa::clean_orphan_yabridge_state();
+
     const fs::path plugin_path = get_this_file_location();
     try {
         // This is the only place where we have to use manual memory management.
@@ -121,6 +128,8 @@ extern "C" YABRIDGE_EXPORT AEffect* yabridge_plugin_init(
     const char* plugin_path) {
     assert(host_callback);
     assert(plugin_path);
+
+    yabridge::nspa::clean_orphan_yabridge_state();
 
     try {
         Vst2PluginBridge* bridge =

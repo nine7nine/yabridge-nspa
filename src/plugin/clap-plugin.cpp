@@ -22,6 +22,7 @@
 #include <version.h>
 
 #include "bridges/clap.h"
+#include "orphan-cleanup.h"
 
 using namespace std::literals::string_literals;
 
@@ -78,6 +79,8 @@ bool clap_entry_init(const char* /*plugin_path*/) {
     // only initialize the bridge on the first call
     if (active_instances.fetch_add(1, std::memory_order_seq_cst) == 0) {
         assert(!bridge);
+
+        yabridge::nspa::clean_orphan_yabridge_state();
 
         // XXX: The host also provides us with the plugin path which we could
         //      just use instead. Should we? The advantage of doing it this way
@@ -139,6 +142,8 @@ CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
 extern "C" YABRIDGE_EXPORT ClapPluginBridge* yabridge_module_init(
     const char* plugin_path) {
     assert(plugin_path);
+
+    yabridge::nspa::clean_orphan_yabridge_state();
 
     try {
         return new ClapPluginBridge(plugin_path);
