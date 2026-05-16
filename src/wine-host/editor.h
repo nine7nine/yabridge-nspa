@@ -321,11 +321,6 @@ class Editor {
     void redetect_host_window() noexcept;
 
     /**
-     * Get offset of parent window to fix mouse coordinates.
-     */
-    std::array<int16_t, 2> get_parent_window_offset();
-
-    /**
      * Reparent `child` to `new_parent`. This includes the flush.
      */
     void do_reparent(xcb_window_t child, xcb_window_t new_parent) const;
@@ -351,13 +346,6 @@ class Editor {
      * the wrapper window is already at the correct size.
      */
     Size wrapper_window_size_;
-
-    /**
-     * Last received configurations for the host and parent windows.
-     */
-    xcb_configure_notify_event_t host_window_config_;
-    xcb_configure_notify_event_t parent_window_config_;
-    bool parent_window_config_abs_;
 
     /**
      * The handle for the window created through Wine that the plugin uses to

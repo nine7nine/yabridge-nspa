@@ -19,6 +19,21 @@
 #include <iostream>
 #include <sstream>
 
+// wine-nspa: WM_X11DRV_NSPA_EMBED_WINDOW driver-private message for atomic
+// X11 embedding under a foreign parent.  We prefer the canonical header
+// from the installed wine-nspa tree, but fall back to a local define so
+// the yabridge build doesn't depend on the header having been installed
+// (some wine-nspa packaging paths haven't picked up include/wine/
+// additions).  Single source of truth is
+// <wine/nspa_x11_embed.h> in the wine-nspa source.
+#if __has_include(<wine/nspa_x11_embed.h>)
+#  include <wine/nspa_x11_embed.h>
+#else
+#  ifndef WM_X11DRV_NSPA_EMBED_WINDOW
+#    define WM_X11DRV_NSPA_EMBED_WINDOW 0x80001004
+#  endif
+#endif
+
 #include <llvm/small-vector.h>
 
 using namespace std::literals::chrono_literals;
@@ -277,9 +292,6 @@ Editor::Editor(MainContext& main_context,
       x11_connection_(xcb_connect(nullptr, nullptr), xcb_disconnect),
       dnd_proxy_handle_(WineXdndProxy::get_handle()),
       wrapper_window_size_(initial_size.value_or(Size(128, 128))),
-      host_window_config_({}),
-      parent_window_config_({}),
-      parent_window_config_abs_(false),
       // Create a window without any decoratiosn for easy embedding. The
       // combination of `WS_EX_TOOLWINDOW` and `WS_POPUP` causes the window to
       // be drawn without any decorations (making resizes behave as you'd
@@ -390,13 +402,23 @@ Editor::Editor(MainContext& main_context,
     xcb_flush(x11_connection_.get());
 
     // First reparent our dumb wrapper window to the host's window, and then
-    // embed the Wine window into our wrapper window
+    // embed the Wine window into our wrapper window via wine-nspa's atomic
+    // embed primitive.  This replaces a manual XReparentWindow + side-effect
+    // bookkeeping; wine-nspa flips data->embedded + data->nspa_embedded + the
+    // managed/override-redirect state in one round-trip, and registers
+    // wrapper_window_ as the foreign parent so its host_window machinery can
+    // propagate host-drag motion to the plugin's WND rect without us doing
+    // any synthetic ConfigureNotify translation here.  See
+    // <wine/nspa_x11_embed.h> for the full interface contract.
     do_reparent(wrapper_window_.window_, parent_window_);
 
     xcb_map_window(x11_connection_.get(), wrapper_window_.window_);
     xcb_flush(x11_connection_.get());
 
-    do_reparent(wine_window_, wrapper_window_.window_);
+    SendMessageW(win32_window_.handle_,
+                 WM_X11DRV_NSPA_EMBED_WINDOW,
+                 static_cast<WPARAM>(wrapper_window_.window_),
+                 0);
 }
 
 void Editor::resize(uint16_t width, uint16_t height) {
@@ -457,26 +479,6 @@ std::optional<Size> Editor::check_size_mismatch() {
 
 void Editor::show() noexcept {
     ShowWindow(win32_window_.handle_, SW_SHOWNORMAL);
-}
-
-std::array<int16_t, 2> Editor::get_parent_window_offset() {
-
-    xcb_generic_error_t* error = nullptr;
-    const xcb_window_t root =
-        get_root_window(*x11_connection_, parent_window_);
-    const xcb_translate_coordinates_cookie_t coord_cookie =
-        xcb_translate_coordinates(x11_connection_.get(), parent_window_, root, 0, 0);
-    const std::unique_ptr<xcb_translate_coordinates_reply_t> coord_reply(
-        xcb_translate_coordinates_reply(x11_connection_.get(), coord_cookie, &error));
-    THROW_X11_ERROR(error);
-
-    logger_.log_editor_trace([&]() {
-        return "DEBUG: Parent window offset " +
-        std::to_string(coord_reply->dst_x) +
-        "x" +
-        std::to_string(coord_reply->dst_y);
-    });
-    return {coord_reply->dst_x, coord_reply->dst_y};
 }
 
 void Editor::handle_x11_events() noexcept {
@@ -546,14 +548,17 @@ void Editor::handle_x11_events() noexcept {
                     }
 
                 } break;
-                // We're listening for `ConfigureNotify` events on the host's
-                // window (i.e. the window that's actually going to get dragged
-                // around the by the user). In most cases this is the same as
-                // `parent_window_`. When either this window gets moved, or when
-                // the user moves his mouse over our window, the local
-                // coordinates should be updated. The additional `EnterWindow`
-                // check is sometimes necessary for using multiple editor
-                // windows within a single plugin group.
+                // ConfigureNotify is no longer load-bearing here.  With
+                // wine-nspa's atomic embed (WM_X11DRV_NSPA_EMBED_WINDOW),
+                // Wine's own host_window machinery subscribes to
+                // StructureNotifyMask on the foreign-parent ancestor chain
+                // (wrapper -> parent_window -> host_window -> ...) via its
+                // own X11 connection and propagates motion down to the
+                // plugin's WND rect through host_window_send_gravity_events.
+                // Yabridge's previous synthetic-ConfigureNotify translation
+                // here (relative/absolute coord math, xcb_send_event back to
+                // wine_window) duplicated that work and is now redundant.
+                // We keep a trace log so the event timeline stays readable.
                 case XCB_CONFIGURE_NOTIFY: {
                     const auto event =
                         reinterpret_cast<xcb_configure_notify_event_t*>(
@@ -567,83 +572,6 @@ void Editor::handle_x11_events() noexcept {
                                std::to_string(event->y) +
                                (is_synthetic_event ? " (synthetic)" : "");
                     });
-
-                    // If the host window is different from the parent window
-                    // then the Wine window is at a non-zero offset from the
-                    // top-left corner. The host window will always receive
-                    // absolute position information in its events, sent from
-                    // the window manager, while the parent window might receive
-                    // position changes relative to the host window when it is a
-                    // child window.
-                    //
-                    // For VST2 plugins in Ardour, there seems to be an
-                    // intermediate wrapper window. However, this window
-                    // receives synthetic (absolute) ConfigureNotify events, so
-                    // in this case we keep track of its position directly.
-                    // If this happens once, we ignore all real ConfigureNotify
-                    // events, as the relative position will not be correct if
-                    // there is another offset window between the parent window
-                    // and the host window (as is the case in Ardour). However,
-                    // we still accept the new dimensions of real
-                    // ConfigureNotify events, as this is necessary for resizing
-                    // to work properly.
-                    if (event->window == host_window_ && is_synthetic_event) {
-                        host_window_config_ = *event;
-                    }
-                    if (event->window == parent_window_) {
-                        if (is_synthetic_event || !parent_window_config_abs_) {
-                            parent_window_config_ = *event;
-                            parent_window_config_abs_ = is_synthetic_event;
-                        } else {
-                            parent_window_config_.width = event->width;
-                            parent_window_config_.height = event->height;
-                        }
-                    }
-
-                    // Window managers are expected to send ConfigureNotify to
-                    // their managed windows whenever the window is being moved
-                    // or resized by the user, so that application don't have to
-                    // do all the relative positioning computation themselves.
-                    // Wine also expects this and ignores position changes on
-                    // its window parents, and its window position would get out
-                    // of sync without this event.
-                    if (event->window == host_window_ ||
-                        event->window == parent_window_) {
-                        xcb_configure_notify_event_t translated_event{};
-                        translated_event.response_type = XCB_CONFIGURE_NOTIFY;
-                        translated_event.event = wine_window_;
-                        translated_event.window = wine_window_;
-                        translated_event.width = parent_window_config_.width;
-                        translated_event.height = parent_window_config_.height;
-                        translated_event.x = parent_window_config_.x;
-                        translated_event.y = parent_window_config_.y;
-                        if (!parent_window_config_abs_ &&
-                            parent_window_ != host_window_) {
-                            translated_event.x += host_window_config_.x;
-                            translated_event.y += host_window_config_.y;
-                        }
-                        if (!is_synthetic_event) {
-                            const std::array<int16_t, 2> offset = get_parent_window_offset();
-                            translated_event.x = offset[0];
-                            translated_event.y = offset[1];
-                        }
-                        logger_.log_editor_trace([&]() {
-                            return "DEBUG: Translated coords: " +
-                                   std::to_string(translated_event.window) +
-                                   " : " +
-                                   std::to_string(translated_event.width) +
-                                   "x" +
-                                   std::to_string(translated_event.height) +
-                                   "+" + std::to_string(translated_event.x) +
-                                   "+" + std::to_string(translated_event.y);
-                        });
-                        xcb_send_event(
-                            x11_connection_.get(), false, wine_window_,
-                            XCB_EVENT_MASK_STRUCTURE_NOTIFY |
-                                XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
-                            reinterpret_cast<char*>(&translated_event));
-                        xcb_flush(x11_connection_.get());
-                    }
                 } break;
                 // We're listening for `ConfigureRequest` events on the wrapper
                 // window. This is received whenever Wine wants to configure its
