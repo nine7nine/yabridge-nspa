@@ -85,14 +85,17 @@ constexpr uint32_t parent_event_mask =
  * The X11 event mask for our wrapper window. We will forward synthetic keyboard
  * events sent by the host to the Wine window.
  *
- * NOTE: The only reason we need this structure notify mask is because Tracktion
- *       Waveform offsets our window a bit vertically, so we need to catch that
- *       `ConfigureNotify` event or else the mouse clicks would be offset
- *       slightly when the mouse is already inside of the editor window when
- *       opening it.
+ * NOTE: We used to select XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT here so we
+ *       could intercept Wine's MapRequest / ConfigureRequest on wine_window
+ *       and rewrite them.  With wine-nspa's nspa_embed surface (atomic
+ *       embed + size suppression for nspa_embedded windows) Wine no longer
+ *       emits those requests against our consumers, and our embed handler
+ *       calls XMapWindow on wine_window directly — so the redirect was
+ *       intercepting nothing.  Dropping it lets Wine's own X11 ops (the
+ *       rare ones that still fire) apply directly to wine_window.
  */
 constexpr uint32_t wrapper_event_mask =
-    XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+    XCB_EVENT_MASK_STRUCTURE_NOTIFY |
     XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE;
 
 /**
@@ -419,6 +422,26 @@ Editor::Editor(MainContext& main_context,
                  WM_X11DRV_NSPA_EMBED_WINDOW,
                  static_cast<WPARAM>(wrapper_window_.window_),
                  0);
+
+    // wine-nspa migration: the previous wrapper SubstructureRedirect dance
+    // had a MapRequest handler that set WM_STATE = NormalState on
+    // wine_window after mapping it.  With SUBSTRUCTURE_REDIRECT removed
+    // and Wine's XMapWindow applying directly, that side effect went
+    // missing — and at least one of (Carla / Wine / the ICCCM
+    // interaction) cares enough that the close button started hanging
+    // the host.  Restore the property write here so the observable X11
+    // state matches the pre-migration behavior; cheaper than re-adding
+    // SUBSTRUCTURE_REDIRECT and the handler dance just to set one
+    // property.
+    {
+        const std::array<uint32_t, 2> wm_state_values{
+            icccm_wm_state_normal, 0};
+        xcb_change_property(
+            x11_connection_.get(), XCB_PROP_MODE_REPLACE,
+            wine_window_, xcb_wm_state_property_,
+            xcb_wm_state_property_, 32, 2, wm_state_values.data());
+        xcb_flush(x11_connection_.get());
+    }
 }
 
 void Editor::resize(uint16_t width, uint16_t height) {
@@ -573,55 +596,17 @@ void Editor::handle_x11_events() noexcept {
                                (is_synthetic_event ? " (synthetic)" : "");
                     });
                 } break;
-                // We're listening for `ConfigureRequest` events on the wrapper
-                // window. This is received whenever Wine wants to configure its
-                // window, and we need to adjust the configuration so that it
-                // stays within our wrapper. Here, wwe could translate window
-                // position changes by moving the wrapper window itself but this
-                // isn't really necessary. Instead, we prevent Wine from
-                // actually moving its window.
-                case XCB_CONFIGURE_REQUEST: {
-                    const auto event =
-                        reinterpret_cast<xcb_configure_request_event_t*>(
-                            generic_event.get());
-                    logger_.log_editor_trace([&]() {
-                        return "DEBUG: ConfigureRequest for window " +
-                               std::to_string(event->window);
-                    });
-                    const uint16_t value_mask =
-                        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
-                        XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT;
-                    const std::array<uint32_t, 4> values{0, 0, event->width,
-                                                         event->height};
-                    xcb_configure_window(x11_connection_.get(), wine_window_,
-                                         value_mask, values.data());
-                    xcb_flush(x11_connection_.get());
-                } break;
-                // We're listening for `MapRequest` events on the wrapper
-                // window. This is received whenever Wine wants to map its
-                // window, and we need to forward the request to the X server.
-                // Wine also expects the window manager to change the WM_STATE
-                // property whenever it has finished mapping the window. We
-                // effectively implement a sub window manager here, so update
-                // the property as we should.
-                case XCB_MAP_REQUEST: {
-                    const auto event =
-                        reinterpret_cast<xcb_map_request_event_t*>(
-                            generic_event.get());
-                    logger_.log_editor_trace([&]() {
-                        return "DEBUG: MapRequest for window " +
-                               std::to_string(event->window);
-                    });
-                    xcb_map_window(x11_connection_.get(), wine_window_);
-
-                    const std::array<uint32_t, 2> values{icccm_wm_state_normal,
-                                                         0};
-                    xcb_change_property(
-                        x11_connection_.get(), XCB_PROP_MODE_REPLACE,
-                        wine_window_, xcb_wm_state_property_,
-                        xcb_wm_state_property_, 32, 2, values.data());
-                    xcb_flush(x11_connection_.get());
-                } break;
+                // Wine's MapRequest / ConfigureRequest cases used to fire
+                // here when wrapper_window selected SUBSTRUCTURE_REDIRECT.
+                // With wine-nspa's atomic embed (size suppression in
+                // window_set_config + explicit XMapWindow in the embed
+                // handler) Wine no longer emits configures or map requests
+                // that need intercepting against an nspa-embedded child.
+                // The wrapper's event mask no longer includes
+                // SUBSTRUCTURE_REDIRECT, so these cases would not fire even
+                // if Wine did emit something — keeping them as dead code
+                // would just confuse the next reader.  Removed.
+                //
                 // We want to grab keyboard input focus when the user hovers
                 // over our embedded Wine window AND that window is a child of
                 // the currently active window. This ensures that the behavior
