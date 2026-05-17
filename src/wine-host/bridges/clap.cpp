@@ -145,7 +145,7 @@ ClapBridge::ClapBridge(MainContext& main_context,
     const std::string init_path = to_dos_path(plugin_dll_path);
     bool init_success;
     {
-        yabridge::nspa::ScopedTimeCriticalBoost rt_boost;
+        yabridge::nspa::ScopedRealtimeIdleBoost rt_boost;
         init_success = entry_->init(init_path.c_str());
     }
 
@@ -180,7 +180,9 @@ bool ClapBridge::inhibits_event_loop() noexcept {
 }
 
 void ClapBridge::run() {
-    yabridge::nspa::set_thread_time_critical();
+    // Main-thread control loop — not audio.  RT-class for child-thread
+    // inheritance only.
+    yabridge::nspa::set_thread_realtime_idle();
 
     sockets_.host_plugin_main_thread_control_.receive_messages(
         std::nullopt,

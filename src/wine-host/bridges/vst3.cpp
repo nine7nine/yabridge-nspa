@@ -125,7 +125,7 @@ Vst3Bridge::Vst3Bridge(MainContext& main_context,
         // static init that request SCHED_FIFO — without an RT-capable
         // parent thread the kernel rejects the pthread_create and the
         // plugin throws boost::thread_resource_error during load.
-        yabridge::nspa::ScopedTimeCriticalBoost rt_boost;
+        yabridge::nspa::ScopedRealtimeIdleBoost rt_boost;
         module_ = VST3::Hosting::Win32Module::create(
             to_dos_path(plugin_dll_path), error);
     }
@@ -158,7 +158,10 @@ bool Vst3Bridge::inhibits_event_loop() noexcept {
 }
 
 void Vst3Bridge::run() {
-    yabridge::nspa::set_thread_time_critical();
+    // Control loop — not audio.  RT-class for child-thread inheritance,
+    // but no need to sit at TIME_CRITICAL alongside actual audio
+    // workers.
+    yabridge::nspa::set_thread_realtime_idle();
 
     sockets_.host_plugin_control_.receive_messages(
         std::nullopt,
@@ -213,7 +216,7 @@ void Vst3Bridge::run() {
                                 // RAII helper restores the caller's prior
                                 // priority on scope exit.
                                 {
-                                    yabridge::nspa::ScopedTimeCriticalBoost
+                                    yabridge::nspa::ScopedRealtimeIdleBoost
                                         boost;
                                     switch (request.requested_interface) {
                                         case Vst3PluginProxy::Construct::
@@ -1222,7 +1225,7 @@ void Vst3Bridge::run() {
                         // during its initialization
                         tresult result;
                         {
-                            yabridge::nspa::ScopedTimeCriticalBoost boost;
+                            yabridge::nspa::ScopedRealtimeIdleBoost boost;
                             // This static cast is required to upcast to
                             // `FUnknown*`
                             result =

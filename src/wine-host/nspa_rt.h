@@ -35,24 +35,53 @@
 // existing (partial) mapping still applies — this is strictly an
 // improvement, never a regression.
 //
-// Two patterns:
+// Three patterns:
 //
 //   set_thread_time_critical()        — set this thread to TIME_CRITICAL
-//                                       and leave it there. Use for
-//                                       thread-entry promotion where the
-//                                       thread lives at RT for its
-//                                       entire lifetime (the audio
-//                                       worker thread, the dispatch
-//                                       event loop).
+//                                       and leave it there. Use ONLY
+//                                       for the genuine audio worker
+//                                       threads (process_replacing
+//                                       handler, per-instance audio
+//                                       handlers). Maps to SCHED_FIFO
+//                                       at NSPA_RT_PRIO (audio band).
 //
-//   ScopedTimeCriticalBoost           — RAII: save current priority,
-//                                       set to TIME_CRITICAL, restore
-//                                       on scope exit. Use for
-//                                       bracketed calls into the plugin
-//                                       where spawned audio worker
-//                                       threads must inherit RT, but
-//                                       the caller's prio should not
-//                                       be left elevated.
+//   set_thread_realtime_idle()        — set this thread to
+//                                       THREAD_PRIORITY_IDLE inside
+//                                       REALTIME_PRIORITY_CLASS (the
+//                                       lowest band of the Win32 RT
+//                                       class).  Named with the
+//                                       "realtime_" prefix to avoid
+//                                       confusion with Linux's
+//                                       SCHED_IDLE policy (which is
+//                                       the opposite — the lowest
+//                                       non-RT band).  Still
+//                                       SCHED_FIFO under NSPA, so
+//                                       spawned children inherit a
+//                                       real-time policy and
+//                                       pthread_create RT requests
+//                                       succeed — but well below the
+//                                       audio band so the dispatch /
+//                                       control / parameters loops
+//                                       don't compete with the audio
+//                                       thread or starve the desktop.
+//                                       Use for thread-entry promotion
+//                                       on non-audio dispatcher loops.
+//
+//   ScopedRealtimeIdleBoost           — RAII: save current priority,
+//                                       set to THREAD_PRIORITY_IDLE,
+//                                       restore on scope exit. Use for
+//                                       bracketed calls into the
+//                                       plugin (plugin construction,
+//                                       LoadLibrary, IPluginBase::
+//                                       initialize, etc.) where
+//                                       spawned worker threads must
+//                                       inherit RT but the caller's
+//                                       prio should not be left
+//                                       elevated. IDLE inside RT class
+//                                       is enough to satisfy the RT
+//                                       inheritance check — no need to
+//                                       run the bracketed code at
+//                                       audio-equivalent priority.
 
 #include <windows.h>
 
@@ -72,6 +101,23 @@ inline void set_thread_time_critical() noexcept {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
 
+// Promote the calling thread to THREAD_PRIORITY_IDLE.  Under
+// REALTIME_PRIORITY_CLASS (yabridge's wine-host process priority class,
+// set in host.cpp:107) this lands at the lowest band of the Win32 RT
+// class — NT 16 — which NSPA maps to SCHED_FIFO at the bottom of the
+// audio range (e.g. FIFO@65 with NSPA_RT_PRIO=80).  Still SCHED_FIFO,
+// so pthread_create inheritance grants children RT and the kernel
+// accepts SCHED_FIFO requests from this thread.  But well below the
+// audio callback band (NT 31 / FIFO@80), so dispatch / control /
+// parameters loops don't compete with audio threads or starve the
+// desktop during heavy plugin init.
+//
+// Name disambiguates from Linux's SCHED_IDLE policy (which is the
+// opposite — lowest non-RT band).
+inline void set_thread_realtime_idle() noexcept {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+}
+
 // Restore the calling thread to THREAD_PRIORITY_NORMAL. Used by code
 // paths that previously called set_realtime_priority(false), which
 // directly demoted to SCHED_OTHER. Routing through SetThreadPriority
@@ -81,7 +127,10 @@ inline void set_thread_normal() noexcept {
 }
 
 // RAII helper: on construction, save the current thread priority and
-// promote to TIME_CRITICAL. On destruction, restore the saved value.
+// promote to THREAD_PRIORITY_IDLE (NT 16 inside REALTIME_PRIORITY_CLASS
+// — the lowest band of the Win32 RT class, still SCHED_FIFO under
+// NSPA but well below the audio band).  On destruction, restore the
+// saved value.
 //
 // This replaces the historical pattern:
 //     set_realtime_priority(true);
@@ -93,55 +142,64 @@ inline void set_thread_normal() noexcept {
 //
 // Why bracket at all? Some plugin entry points (plugin construction,
 // IPluginBase::initialize, certain VST2 dispatch opcodes like
-// effSetSampleRate/effSetBlockSize) spawn audio worker threads
-// internally. Those threads inherit the creator's scheduling via
-// pthread_create's default PTHREAD_INHERIT_SCHED. By boosting the
-// caller to TIME_CRITICAL before the plugin call, we ensure spawned
-// workers come up at the NSPA-mapped audio band, not at the caller's
-// regular priority.
+// effSetSampleRate/effSetBlockSize) spawn worker threads internally.
+// Those threads inherit the creator's scheduling policy via
+// pthread_create's default PTHREAD_INHERIT_SCHED.  By boosting the
+// caller into the RT class before the plugin call, we ensure spawned
+// workers come up SCHED_FIFO and pthread_create's RT inheritance
+// check passes.  THREAD_PRIORITY_IDLE (rather than TIME_CRITICAL) is
+// enough — the bracket is about giving children an RT parent, not
+// about running the bracketed plugin code at audio priority.  Heavy
+// init (LoadLibrary, preset enumeration, sample loading) used to
+// freeze the desktop for ~1s when bracketed at TIME_CRITICAL because
+// it competed with the actual audio callback thread.
+//
+// Plugin worker threads that genuinely need audio-band priority
+// (their own audio callback thread) explicitly call
+// SetThreadPriority(TIME_CRITICAL) themselves — they don't rely on
+// inheriting the bracketed priority.
 //
 // Also used to bracket LoadLibrary itself (see load_library_rt below).
 // The plugin's DllMain runs synchronously inside LoadLibrary, and some
 // plugins (notably u-he's VST3s — Zebra2, ACE, etc.) spawn
 // boost::thread workers during PROCESS_ATTACH static init. If the
-// caller is at default priority and the plugin's pthread_create asks
-// for SCHED_FIFO, the kernel rejects the request (the parent has no
-// RT entitlement to grant), boost::thread throws
-// thread_resource_error, and the plugin dies before reaching the
-// plugin's normal entry point.
-class ScopedTimeCriticalBoost {
+// caller is outside the RT class and the plugin's pthread_create asks
+// for SCHED_FIFO, the kernel rejects the request, boost::thread
+// throws thread_resource_error, and the plugin dies before reaching
+// its normal entry point.
+class ScopedRealtimeIdleBoost {
    public:
-    ScopedTimeCriticalBoost() noexcept
+    ScopedRealtimeIdleBoost() noexcept
         : saved_priority_(GetThreadPriority(GetCurrentThread())) {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
     }
 
-    ~ScopedTimeCriticalBoost() noexcept {
+    ~ScopedRealtimeIdleBoost() noexcept {
         SetThreadPriority(GetCurrentThread(), saved_priority_);
     }
 
-    ScopedTimeCriticalBoost(const ScopedTimeCriticalBoost&) = delete;
-    ScopedTimeCriticalBoost& operator=(const ScopedTimeCriticalBoost&) = delete;
-    ScopedTimeCriticalBoost(ScopedTimeCriticalBoost&&) = delete;
-    ScopedTimeCriticalBoost& operator=(ScopedTimeCriticalBoost&&) = delete;
+    ScopedRealtimeIdleBoost(const ScopedRealtimeIdleBoost&) = delete;
+    ScopedRealtimeIdleBoost& operator=(const ScopedRealtimeIdleBoost&) = delete;
+    ScopedRealtimeIdleBoost(ScopedRealtimeIdleBoost&&) = delete;
+    ScopedRealtimeIdleBoost& operator=(ScopedRealtimeIdleBoost&&) = delete;
 
    private:
     int saved_priority_;
 };
 
-// LoadLibrary wrapped in a ScopedTimeCriticalBoost so plugins which
+// LoadLibrary wrapped in a ScopedRealtimeIdleBoost so plugins which
 // spawn boost::thread / std::thread workers during DllMain
 // PROCESS_ATTACH or static-initializer code (u-he VST3s among others)
-// see an RT-capable parent thread and the kernel grants their
+// see an RT-class parent thread and the kernel grants their
 // pthread_create RT requests. Used as the member-initializer
 // expression for the plugin handle on each bridge.
 //
 // Returning the result from a body block via a lambda is the only way
 // to keep this an in-line expression while still scoping the boost
 // guard to the LoadLibrary call alone — we don't want the wrapping
-// bridge's other member inits running at TIME_CRITICAL.
+// bridge's other member inits running at elevated priority.
 inline HMODULE load_library_rt(const char* path) noexcept {
-    ScopedTimeCriticalBoost boost;
+    ScopedRealtimeIdleBoost boost;
     // Explicit `LoadLibraryA` rather than the `LoadLibrary` macro: the
     // macro resolves to `LoadLibraryW` under UNICODE builds and the
     // bridge call sites pass a `const char*` (the converted DOS path

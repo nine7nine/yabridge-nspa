@@ -206,7 +206,7 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     // the SCHED_FIFO promotion at the NSPA-configured band; under vanilla
     // Wine the existing Win32 → nice mapping applies.
     {
-        yabridge::nspa::ScopedTimeCriticalBoost boost;
+        yabridge::nspa::ScopedRealtimeIdleBoost boost;
         plugin_ = vst_entry_point(
             reinterpret_cast<audioMasterCallback>(host_callback_proxy));
     }
@@ -271,7 +271,10 @@ Vst2Bridge::Vst2Bridge(MainContext& main_context,
     pi_cond_reply_local_.reserve(yabridge::nspa::audio_control_buf_size);
 
     parameters_handler_ = Win32Thread([&]() {
-        yabridge::nspa::set_thread_time_critical();
+        // Parameter set/get loop — not the audio thread.  RT-class for
+        // child-thread inheritance, but no need to sit at TIME_CRITICAL
+        // alongside the actual audio worker.
+        yabridge::nspa::set_thread_realtime_idle();
         pthread_setname_np(pthread_self(), "parameters");
 
         sockets_.host_plugin_parameters_.receive_multi<Parameter>(
@@ -556,7 +559,10 @@ bool Vst2Bridge::inhibits_event_loop() noexcept {
 }
 
 void Vst2Bridge::run() {
-    yabridge::nspa::set_thread_time_critical();
+    // Dispatch event loop — not audio.  RT-class for child-thread
+    // inheritance, but no need to compete with TIME_CRITICAL audio
+    // threads or starve the desktop.
+    yabridge::nspa::set_thread_realtime_idle();
 
     sockets_.host_plugin_dispatch_.receive_events(
         std::nullopt,
@@ -620,7 +626,7 @@ void Vst2Bridge::run() {
                                 intptr_t result;
                                 {
                                     std::optional<
-                                        yabridge::nspa::ScopedTimeCriticalBoost>
+                                        yabridge::nspa::ScopedRealtimeIdleBoost>
                                         boost;
                                     if (is_realtime_request) {
                                         boost.emplace();
